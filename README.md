@@ -16,6 +16,8 @@
 >
 > 详细硬件清单与边界说明：[docs/hardware-drivers.md](docs/hardware-drivers.md)
 >
+> 直接下载：[硬件驱动增强版 Release](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/tag/v1.3.11-beta.14-hardware-drivers)
+>
 > 这些入口只负责**发现并启动厂商自己的软件**，不冒充厂商驱动，也不向未经验证的硬件发送报文。
 
 <img src="docs/images/app-icon.png" alt="MyFinder Device Battery 冰川蓝双卡图标" width="96" height="96">
