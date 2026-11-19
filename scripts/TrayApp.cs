@@ -1,0 +1,1841 @@
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Collections.Generic;
+using System.Windows.Forms;
+using Microsoft.Win32;
+using AtkBattery;
+
+namespace AtkBatteryTray {
+    public static class Style {
+        static bool? systemDark;
+        public static void InvalidateTheme(){systemDark=null;}
+        public static bool TaskbarDark {get{
+            if(!systemDark.HasValue)using(var key=Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))systemDark=key!=null&&Convert.ToInt32(key.GetValue("SystemUsesLightTheme",1))==0;
+            return systemDark.Value;
+        }}
+        public static bool Dark {
+            get {
+                var appearance=DeviceSettings.Current.Theme;
+                if(appearance=="dark")return true;if(appearance=="light")return false;
+                return TaskbarDark;
+            }
+        }
+        public static GraphicsPath Round(RectangleF rect,float radius) {
+            var p=new GraphicsPath();float d=radius*2;
+            p.AddArc(rect.Left,rect.Top,d,d,180,90);p.AddArc(rect.Right-d,rect.Top,d,d,270,90);
+            p.AddArc(rect.Right-d,rect.Bottom-d,d,d,0,90);p.AddArc(rect.Left,rect.Bottom-d,d,d,90,90);p.CloseFigure();return p;
+        }
+        public static void Text(Graphics g,string s,float size,FontStyle fontStyle,Color color,RectangleF rect,StringAlignment align) {
+            using(var f=new Font("Segoe UI",size,fontStyle,GraphicsUnit.Pixel))
+            using(var b=new SolidBrush(color))
+            using(var sf=new StringFormat {Alignment=align,LineAlignment=StringAlignment.Center,Trimming=StringTrimming.EllipsisCharacter})
+                g.DrawString(s,f,b,rect,sf);
+        }
+        public static void Pill(Graphics g,RectangleF rect,string label,bool selected,bool enabled,Color fg,Color muted,Color card) {
+            Color fill=selected?Color.FromArgb(32,fg):card;
+            Color text=enabled?fg:muted;
+            using(var path=Round(rect,9))
+            using(var b=new SolidBrush(fill))g.FillPath(b,path);
+            using(var p=new Pen(Color.FromArgb(selected?90:35,text),1))
+            using(var path=Round(new RectangleF(rect.X+.5f,rect.Y+.5f,rect.Width-1,rect.Height-1),9))g.DrawPath(p,path);
+            Text(g,label,10,selected?FontStyle.Bold:FontStyle.Regular,text,rect,StringAlignment.Center);
+        }
+        public static void Ring(Graphics g,RectangleF rect,int? percent,bool charge,Color color) {
+            using(var track=new Pen(Color.FromArgb(70,color),3.0f))
+            using(var value=new Pen(color,3.0f)) {
+                track.StartCap=LineCap.Round;track.EndCap=LineCap.Round;
+                value.StartCap=LineCap.Round;value.EndCap=LineCap.Round;
+                g.DrawArc(track,rect,-90,360);
+                if(percent.HasValue && percent.Value>0)g.DrawArc(value,rect,-90,Math.Max(4,percent.Value*3.6f));
+            }
+            Text(g,percent.HasValue?percent.Value.ToString():"--",rect.Height*.27f,FontStyle.Bold,color,rect,StringAlignment.Center);
+            if(charge) {
+                using(var p=new Pen(color,1.1f))
+                    g.DrawLines(p,new PointF[]{new PointF(rect.X+rect.Width*.58f,rect.Y+rect.Height*.16f),new PointF(rect.X+rect.Width*.42f,rect.Y+rect.Height*.53f),new PointF(rect.X+rect.Width*.61f,rect.Y+rect.Height*.53f),new PointF(rect.X+rect.Width*.45f,rect.Y+rect.Height*.88f)});
+            }
+        }
+        public static Bitmap Tray(int? percent,bool charge,bool dark,bool stale,bool approximate=false) {
+            return TrayGlyph.Render(percent,charge,dark,stale,SystemInformation.SmallIconSize.Width,approximate);
+        }
+    }
+    public sealed class Details:Form {
+        readonly TrayContext owner;
+        readonly System.Windows.Forms.Timer animation=new System.Windows.Forms.Timer();
+        Size targetSize=VisualDesign.PanelSize;
+        readonly System.Windows.Forms.Timer layoutAnimation=new System.Windows.Forms.Timer();
+        readonly Stopwatch layoutClock=new Stopwatch();
+        float headsetProgress,layoutStart,layoutTarget;
+        HeadsetReading displayHeadset;
+        AudioReading displayAudio;
+        Point anchor;
+        TrayPanelAnchor? updatedAnchor;
+        string updatedNotice;
+        readonly System.Windows.Forms.Timer updatedNoticeTimer=new System.Windows.Forms.Timer {Interval=6000};
+        float animationProgress;
+        float batteryProgress=1f;
+        bool batteryOpening;
+        readonly Stopwatch motionClock=new Stopwatch();
+        float motionStart,motionTarget,motionDurationMs;
+        bool closing;
+        bool disposingPopup;
+        int presentationEpoch;
+        int presentationDepth;
+        bool ignoreDeactivate;
+        bool feedbackModal;
+        readonly System.Windows.Forms.Timer deactivateRelease=new System.Windows.Forms.Timer();
+        bool deferredDeactivation;
+        int deactivationEpoch;
+        int hoverStage=-1;
+        bool hoverRefresh;
+        bool hoverSettings;
+        float dpiScale=1f;
+        int keyboardFocus=-1;
+        bool keyboardFocusVisible;
+        string keyboardFocusKey;
+        int keyboardFocusIndex;
+        int hoverAudio=-1;
+        readonly PopupNavigation navigation=new PopupNavigation();
+        int hoverAction=-1,pressedAction=-1;
+        PopupControl pressedControl;
+        PopupPage pressedPage;
+        bool draggingVolume;
+        bool volumeCollapsed;
+        string panelLayout;
+        int gridControlScroll;
+        string gridControlKey;
+        bool gridFocusNeedsReveal;
+        string volumeEndpoint;
+        string lastHoverTip;
+        readonly System.Windows.Forms.Timer feedbackTimer=new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer pageAnimation=new System.Windows.Forms.Timer();
+        readonly Stopwatch pageClock=new Stopwatch();
+        float pageProgress=1f;
+        int pageStartHeight;
+        readonly ToolTip controlTip=new ToolTip {InitialDelay=350,ReshowDelay=100,AutoPopDelay=2000,ShowAlways=true};
+        byte frameAlpha=255;
+        bool layeredRendering=true;
+        bool renderPreviewSaved;
+        string lastPresentedKey;
+        [StructLayout(LayoutKind.Sequential)] struct NativePoint {public int X,Y;public NativePoint(int x,int y){X=x;Y=y;}}
+        [StructLayout(LayoutKind.Sequential)] struct NativeSize {public int Width,Height;public NativeSize(int w,int h){Width=w;Height=h;}}
+        [StructLayout(LayoutKind.Sequential,Pack=1)] struct NativeBlend {public byte Operation,Flags,Alpha,Format;}
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd,IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc,IntPtr obj);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("user32.dll",SetLastError=true)] static extern bool UpdateLayeredWindow(IntPtr hwnd,IntPtr destination,ref NativePoint position,ref NativeSize size,IntPtr source,ref NativePoint origin,int colorKey,ref NativeBlend blend,int flags);
+        [DllImport("user32.dll",EntryPoint="GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr hwnd,int index);
+        [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr hwnd,int index,IntPtr value);
+        readonly Action<string> copyText,openLink;
+        public Details(TrayContext context,Action<string> copy=null,Action<string> open=null) {
+            copyText=copy??Clipboard.SetText;openLink=open??new Action<string>(delegate(string url){Process.Start(new ProcessStartInfo(url) {UseShellExecute=true});});
+            owner=context;FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;
+            dpiScale=NativeDisplay.ScaleAt(Cursor.Position);
+            Text="设备电量与音频控制";AccessibleName=Text;
+            displayHeadset=owner.Headset;displayAudio=owner.Audio;
+            volumeCollapsed=DeviceSettings.Current.VolumeCollapsed;
+            panelLayout=DeviceSettings.Current.PanelLayout;
+            headsetProgress=VisualDesign.HasAudioCard(displayHeadset,displayAudio)?1f:0f;
+            layoutTarget=headsetProgress;
+            targetSize=VisualDesign.PanelSizeFor(headsetProgress>0f,owner.Dpi);
+            ClientSize=UiState.ScaleSize(targetSize,dpiScale);DoubleBuffered=true;Font=new Font("Segoe UI",9);
+            animation.Interval=16;animation.Tick+=delegate {AdvanceAnimation();};
+            layoutAnimation.Interval=16;layoutAnimation.Tick+=delegate {AdvanceLayout();};
+            feedbackTimer.Interval=285;feedbackTimer.Tick+=delegate {feedbackTimer.Stop();Invalidate();};
+            updatedNoticeTimer.Tick+=delegate{updatedNoticeTimer.Stop();updatedNotice=null;Invalidate();};
+            pageAnimation.Interval=16;pageAnimation.Tick+=delegate {
+                float t=Math.Min(1f,(float)pageClock.Elapsed.TotalMilliseconds/160f);pageProgress=1f-(float)Math.Pow(1-t,3);
+                if(t>=1f){pageProgress=1;pageAnimation.Stop();}UpdateLayoutSize();Invalidate();
+            };
+            deactivateRelease.Interval=16;deactivateRelease.Tick+=delegate {CheckDeferredDeactivation();};
+            Activated+=delegate {CancelDeferredDeactivation();};
+            Deactivate+=delegate {HandleDeactivation();};
+            MouseCaptureChanged+=delegate {if(!Capture){CancelPointerInteraction();Invalidate();}};
+            MouseDown+=delegate(object sender,MouseEventArgs e) {
+                if(e.Button!=MouseButtons.Left||closing)return;
+                keyboardFocusVisible=false;HidePointerTip();
+                CancelPointerInteraction(false);
+                pressedControl=PopupPages.Hit(ControlsForPage(),PanelPoint(e.Location));pressedPage=navigation.Page;
+                pressedAction=pressedControl==null?-1:pressedControl.Id;
+                if(pressedAction==240&&owner.Audio!=null){draggingVolume=true;volumeEndpoint=owner.Audio.VolumeEndpointId;navigation.VolumePreview=PopupPages.VolumeAt(pressedControl.Rect,PanelPoint(e.Location).X);Capture=true;}
+                Invalidate();
+            };
+            MouseUp+=delegate(object sender,MouseEventArgs e) {
+                if(e.Button==MouseButtons.Right&&!closing) {ShowCardContextMenu(e.Location);return;}
+                if(e.Button!=MouseButtons.Left||closing)return;
+                var target=PopupPages.Hit(ControlsForPage(),PanelPoint(e.Location));
+                var pressed=pressedControl;var page=pressedPage;bool wasDragging=draggingVolume;
+                int value=navigation.VolumePreview;string endpoint=volumeEndpoint;
+                HidePointerTip();
+                CancelPointerInteraction();keyboardFocus=-1;keyboardFocusKey=null;
+                // Releasing capture cancels the stored interaction synchronously.
+                // Commit only the valid drag snapshot taken before that callback.
+                if(wasDragging){if(pressed!=null&&pressed.Id==240&&page==navigation.Page&&value>=0&&value<=100&&VolumeTargetAvailable(endpoint))owner.SelectOutputVolume(endpoint,value);}
+                else if(target!=null&&pressed!=null&&PopupPages.SameAction(target,pressed)&&page==navigation.Page&&target.Rect==pressed.Rect&&target.VisibleRect==pressed.VisibleRect)PerformAction(target);
+                Invalidate();
+            };
+            MouseMove+=delegate(object sender,MouseEventArgs e) {
+                var point=PanelPoint(e.Location);
+                if(draggingVolume&&pressedControl!=null){navigation.VolumePreview=PopupPages.VolumeAt(pressedControl.Rect,point.X);Invalidate();return;}
+                var controls=ControlsForPage();var target=PopupPages.Hit(controls,point);int next=target==null?-1:target.Id;
+                var tipTarget=target??controls.Find(delegate(PopupControl c){return c.VisibleRect.Contains(point);});
+                string tip=tipTarget==null?null:tipTarget.Text+(String.IsNullOrEmpty(tipTarget.Value)?"":"："+tipTarget.Value)+(String.IsNullOrEmpty(tipTarget.Detail)?"":"\n"+tipTarget.Detail);
+                if(navigation.Page!=PopupPage.Main&&point.Y>targetSize.Height-28){var feedback=owner.GetFeedback();tip=feedback.AudioFailure??feedback.DpiFailure??navigation.Notice;}
+                if(next!=hoverAction||tip!=lastHoverTip){
+                    hoverAction=next;hoverStage=next>=10&&next<18?next-10:-1;hoverAudio=next>=100&&next<=102?next-100:-1;hoverRefresh=next==0;hoverSettings=next==1;
+                    lastHoverTip=tip;controlTip.SetToolTip(this,tip);Invalidate();
+                }
+                Cursor=target==null?Cursors.Default:Cursors.Hand;
+            };
+            MouseLeave+=delegate {lastHoverTip=null;hoverAction=-1;hoverStage=-1;hoverRefresh=false;hoverSettings=false;hoverAudio=-1;controlTip.SetToolTip(this,null);Cursor=Cursors.Default;Invalidate();};
+            MouseWheel+=delegate(object sender,MouseEventArgs e) {
+                if(navigation.Page!=PopupPage.Main){navigation.Offset=Math.Max(0,navigation.Offset+(e.Delta<0?1:-1));UpdateLayoutSize();Invalidate();}
+                else if(MainUsesDeviceLayout){
+                    if(VisualDesign.GridLayout){
+                        var layout=MainWireless();var point=PanelPoint(e.Location);
+                        if(layout.Grid.Viewport.Contains(point)){
+                            int next=Math.Max(0,Math.Min(layout.Grid.MaximumScroll,gridControlScroll+(e.Delta<0?1:-1)*(VisualDesign.SelectionHeight+GridLayout.TitleHeight+8)));
+                            if(next!=gridControlScroll){ClearGridPointer();gridControlScroll=next;AccessibilityNotifyClients(AccessibleEvents.LocationChange,-1);Invalidate();}return;
+                        }
+                        if(point.Y>=layout.Grid.Controls.Top)return;
+                    }
+                    CancelPointerInteraction();navigation.DeviceScroll=Math.Max(0,navigation.DeviceScroll+(e.Delta<0?1:-1)*(VisualDesign.GridLayout?2:1));
+                    if(VisualDesign.GridLayout)navigation.DeviceScroll=MainWireless().Start;UpdateLayoutSize();ReconcileKeyboardFocus(ControlsForPage());Invalidate();
+                }
+            };
+        }
+        void CancelPointerInteraction(bool releaseCapture=true) {
+            draggingVolume=false;navigation.VolumePreview=-1;volumeEndpoint=null;pressedControl=null;pressedAction=-1;pressedPage=navigation.Page;
+            if(releaseCapture&&Capture)Capture=false;
+        }
+        void HidePointerTip(){
+            bool hadTip=!String.IsNullOrEmpty(lastHoverTip);lastHoverTip=null;
+            if(disposingPopup||Disposing||IsDisposed)return;
+            if(hadTip&&IsHandleCreated)controlTip.Hide(this);
+            controlTip.SetToolTip(this,null);
+        }
+        bool VolumeTargetAvailable(string endpoint){return owner.AudioControlsAvailable&&owner.Audio!=null&&owner.Audio.OutputVolumePercent.HasValue&&!String.IsNullOrEmpty(endpoint)&&AudioControl.SameId(endpoint,owner.Audio.VolumeEndpointId);}
+        void SetSliderValue(PopupControl control,int value){var audio=owner.Audio;if(control!=null&&control.Enabled&&control.Slider&&audio!=null&&VolumeTargetAvailable(audio.VolumeEndpointId))owner.SelectOutputVolume(audio.VolumeEndpointId,Math.Max(0,Math.Min(100,value)));}
+        void SyncAudioScope() {
+            bool audioPage=navigation.Page==PopupPage.Audio||navigation.Page==PopupPage.Bindings||navigation.Page==PopupPage.PickBinding;
+            if(!audioPage){navigation.AudioDeviceKey=null;navigation.AudioDeviceName=null;}
+            owner.SetAudioScope(audioPage?navigation.AudioDeviceKey:null);
+        }
+        Rectangle PanelWorkArea {get{return updatedAnchor.HasValue?updatedAnchor.Value.WorkArea:TrayPanelPlacement.WorkingArea(Screen.FromPoint(anchor));}}
+        void ClearGridPointer(){CancelPointerInteraction();HidePointerTip();hoverAction=-1;hoverStage=-1;hoverAudio=-1;hoverRefresh=false;hoverSettings=false;Cursor=Cursors.Default;}
+        string GridControlKey(WirelessLayout layout){
+            var key=new StringBuilder();
+            foreach(var group in layout.Grid.Groups){
+                key.Append('|').Append(group.Card.Id).Append(':').Append(group.Audio).Append(':').Append(group.Count);
+                if(group.Card.NativeMouse){key.Append(':').Append(owner.NativeDpiToken);foreach(var stage in group.Card.Dpi.Stages)key.Append(':').Append(stage.XDpi).Append('/').Append(stage.YDpi);}
+                else if(!group.Audio){key.Append(':').Append(group.Card.Device.Dpi.TargetToken);foreach(int stage in group.Card.Device.Dpi.Stages)key.Append(':').Append(stage);}
+            }
+            return key.ToString();
+        }
+        WirelessLayout MainWireless(){
+            var layout=WirelessLayout.Build(owner,navigation.DeviceScroll,(int)(PanelWorkArea.Height/dpiScale)-24,false,gridControlScroll);
+            if(layout.Grid!=null){
+                string key=GridControlKey(layout);
+                if(key!=gridControlKey){if(gridControlKey!=null)ClearGridPointer();gridControlKey=key;layout.Grid.ScrollTo(0);gridFocusNeedsReveal=true;}
+                if(gridControlScroll!=layout.Grid.ScrollOffset)gridFocusNeedsReveal=true;
+                gridControlScroll=layout.Grid.ScrollOffset;navigation.DeviceScroll=layout.Start;
+            }
+            return layout;
+        }
+        PopupControl RevealGridControl(PopupControl control){
+            if(control==null||!control.Viewport.HasValue||navigation.Page!=PopupPage.Main||!VisualDesign.GridLayout)return control;
+            var layout=MainWireless();var group=layout.Grid.Groups.Find(delegate(GridControlGroup item){return item.Card.Id==control.DeviceKey&&item.Audio==(control.Id>=100&&control.Id<=102);});
+            if(group==null)return null;
+            var rect=RectangleF.Union(group.Title,group.Track);rect.Inflate(0,3);
+            if(rect.Height>layout.Grid.Viewport.Height){rect=control.Rect;rect.Inflate(0,3);}
+            int next=layout.Grid.RevealOffset(rect);
+            if(next!=gridControlScroll){ClearGridPointer();gridControlScroll=next;AccessibilityNotifyClients(AccessibleEvents.LocationChange,-1);}
+            return PopupPages.FindStable(ControlsForPage(),control.StableKey);
+        }
+        bool MainUsesDeviceLayout {get{return owner.UseWirelessLayout||VisualDesign.GridLayout;}}
+        List<PopupControl> ControlsForPage(){
+            float workHeight=PanelWorkArea.Height/dpiScale;
+            navigation.MaximumHeight=(int)workHeight-24;
+            int rowStep=VisualDesign.LargeFont?40:36;
+            navigation.VisibleChoices=Math.Max(2,Math.Min(7,(int)((workHeight-88)/rowStep)-2));
+            var controls=PopupPages.Build(owner,navigation,headsetProgress>.98f,navigation.Page==PopupPage.Main&&MainUsesDeviceLayout?MainWireless():null);
+            if(navigation.Page==PopupPage.Main&&!MainUsesDeviceLayout){
+                float top=VisualDesign.MouseCardHeight(owner.Dpi)+VisualDesign.SecondCardStep*headsetProgress+VisualDesign.CardGap;
+                bool secondCard=headsetProgress>.98f||VisualDesign.AudioCardFor(owner.Headset,owner.Audio)!=null;
+                float delta=top-VisualDesign.SystemVolumeRectFor(secondCard,owner.Dpi).Top;
+                foreach(var control in controls)if(control.Id==240||control.Id==241||control.Id==0||control.Id==1){var rectangle=control.Rect;rectangle.Offset(0,delta);control.Rect=rectangle;}
+            }
+            return controls;
+        }
+        void Go(PopupPage page) {
+            pageStartHeight=targetSize.Height;string stable=keyboardFocusKey;int focus=keyboardFocus>=0?keyboardFocus:hoverAction;if(stable==null){var hovered=ControlsForPage().Find(delegate(PopupControl c){return c.Id==focus;});if(hovered!=null)stable=hovered.StableKey;}navigation.Go(page,focus,stable);SyncAudioScope();keyboardFocus=-1;keyboardFocusKey=null;StartPageMotion();
+        }
+        public void ShowPreferences(){Go(PopupPage.Preferences);}
+        internal string CurrentPage {get{return navigation.Page.ToString();}}
+        void Back() {pageStartHeight=targetSize.Height;keyboardFocus=navigation.Back();keyboardFocusKey=navigation.ReturnedFocusKey;SyncAudioScope();StartPageMotion();var controls=ControlsForPage();ReconcileKeyboardFocus(controls);if(navigation.Page==PopupPage.Main&&VisualDesign.GridLayout&&keyboardFocusKey!=null)FocusControl(PopupPages.FindStable(controls,keyboardFocusKey));}
+        void StartPageMotion(){CancelPointerInteraction();hoverAction=-1;hoverStage=-1;hoverAudio=-1;hoverRefresh=false;hoverSettings=false;HidePointerTip();pageProgress=PopupPages.Reduced?1:0;pageClock.Restart();if(pageProgress==0)pageAnimation.Start();UpdateLayoutSize();Invalidate();}
+        void PerformAction(PopupControl control) {
+            if(control==null||!control.Enabled||control.Information)return;
+            HidePointerTip();
+            int id=control.Id;
+            if(control.DeviceKey=="empty"){if(!owner.GenericScanning)Go(WirelessLayout.Build(owner,0,100000).AllHidden?PopupPage.Devices:PopupPage.DeviceMissing);return;}
+            if(id==241){CancelPointerInteraction();owner.SetVolumeCollapsed(!DeviceSettings.Current.VolumeCollapsed);return;}
+            if(id==902||id==903){var layout=MainWireless();navigation.DeviceScroll=id==902?Math.Max(0,layout.Start-(layout.Grid==null?layout.Cards.Count:layout.Grid.VisibleRows*2)):layout.End;UpdateLayoutSize();Invalidate();return;}
+            if(id>=1000&&id<3000) {
+                if(id>=2000){owner.RefreshWireless(control.DeviceKey);return;}
+                if(navigation.Page==PopupPage.Devices){navigation.SelectedDeviceKey=control.DeviceKey;navigation.SelectedDeviceName=control.Text;Go(PopupPage.ManageDevice);return;}
+                if(control.DeviceKey=="native:mouse"){Go(PopupPage.Mouse);return;}if(control.DeviceKey=="native:headset"){Go(PopupPage.Headset);return;}
+                navigation.SelectedDeviceKey=control.DeviceKey;navigation.SelectedDeviceName=control.Text;Go(PopupPage.Device);return;
+            }
+            if(id==0||id==4||id==5){owner.RefreshDevice(id==4?"mouse":id==5?"headset":"all");return;}
+            if(id==1){Go(PopupPage.More);return;}if(id==6){Back();return;}
+            if(id>=10&&id<18){owner.SelectDpiStage(id-10,control.TargetToken);SchedulePendingHint();return;}
+            if(id>=3000&&control.DpiValue>0){owner.SelectWirelessDpi(control.DeviceKey,control.TargetToken,control.DpiValue);SchedulePendingHint();return;}
+            if(id==100||id==101){owner.SelectAudioOutput(id==100?"speaker":"headset");SchedulePendingHint();return;}
+            if(id==102){owner.ToggleMicrophoneMute();SchedulePendingHint();return;}
+            if(id==2){Go(PopupPage.Mouse);return;}if(id==3){Go(PopupPage.Headset);return;}
+            if(id==200){bool scoped=navigation.Page==PopupPage.Device;navigation.AudioDeviceKey=scoped?navigation.SelectedDeviceKey:null;navigation.AudioDeviceName=scoped?navigation.SelectedDeviceName:null;Go(PopupPage.Audio);owner.RefreshAudioDevices();return;}if(id==201){Go(PopupPage.Preferences);return;}
+            if(id==202){Go(PopupPage.Diagnostics);return;}if(id==203){Go(PopupPage.Bindings);return;}if(id==204){owner.ExitThread();return;}
+            if(id==260){owner.OpenUpdate();return;}if(id==261){owner.CheckUpdates();return;}
+            if(id==206){Go(PopupPage.Devices);return;}if(id==251){owner.RefreshWireless(navigation.SelectedDeviceKey);return;}
+            if(id==207){Go(PopupPage.DeviceMissing);return;}
+            if(id==205){owner.RefreshAudioDevices();return;}
+            if(id==257){navigation.SelectedDeviceKey=control.DeviceKey;var cards=WirelessLayout.Build(owner,0,100000,true).All;var card=cards.Find(delegate(WirelessCard item){return item.Id==control.DeviceKey;});navigation.SelectedDeviceName=card==null?control.Text:card.Name;Go(PopupPage.ManageDevice);return;}
+            if(id==256){if(control.DeviceKey=="native:mouse")Go(PopupPage.Mouse);else if(control.DeviceKey=="native:headset")Go(PopupPage.Headset);else if(control.DeviceKey=="native:audio"){navigation.AudioDeviceKey=null;navigation.AudioDeviceName=null;Go(PopupPage.Audio);}else Go(PopupPage.Device);return;}
+            try {
+                var pref=DeviceSettings.Current;
+                if(control.ActionKey=="tray:pin"&&navigation.Page==PopupPage.ChoosePreference&&navigation.PreferenceAction==211) {
+                    pref.TrayDeviceId=control.DeviceKey;owner.SavePreferences(pref);owner.ConfigurationChanged(false);Back();return;
+                }
+                if(control.ActionKey!=null&&control.ActionKey.StartsWith("tray:",StringComparison.Ordinal)){PerformTrayAction(control,pref);return;}
+                if(id==211){Go(PopupPage.TrayIcons);return;}
+                if(id==210||id==213||id==216||id==223||id==224||id==228||id==229){navigation.PreferenceAction=id;Go(PopupPage.ChoosePreference);return;}
+                if(id>=470&&id<=472&&navigation.Page==PopupPage.ChoosePreference&&navigation.PreferenceAction==229){
+                    pref.PanelLayout=PanelLayouts.Keys[id-470];navigation.DeviceScroll=0;owner.SavePreferences(pref);owner.ConfigurationChanged(false);UpdateLayoutSize();Invalidate();return;
+                }
+                if((id==460||id==461)&&navigation.Page==PopupPage.ChoosePreference&&navigation.PreferenceAction==228){pref.FontSize=id==461?"large":"normal";owner.SavePreferences(pref);owner.ConfigurationChanged(false);Back();return;}
+                if((id==450||id==451)&&navigation.Page==PopupPage.ChoosePreference&&navigation.PreferenceAction==224){pref.TrayIconStyle=id==450?"number":"device";owner.SavePreferences(pref);owner.ConfigurationChanged(false);Back();return;}
+                if(id>=440&&id<=443&&navigation.Page==PopupPage.ChoosePreference&&navigation.PreferenceAction==223) {
+                    pref.ThemeStyle=ThemePalette.Keys[id-440];owner.SavePreferences(pref);owner.ConfigurationChanged(false);UpdateLayoutSize();Invalidate();return;
+                }
+                if(id>=400&&id<=432) {
+                    if(id<=402)pref.Theme=id==400?"auto":id==401?"light":"dark";
+                    else if(id>=410&&id<=415){pref.TraySource=id==410?"auto":id==411?"mouse":id==412?"headset":id==413?"keyboard":id==414?"lowest":"active";pref.TrayDeviceId=null;}
+                    else if(id>=420&&id<=422)pref.WarningThreshold=id==420?10:id==421?15:20;
+                    else if(id>=430)pref.BackgroundSeconds=id==430?60:id==431?120:300;else return;
+                    owner.SavePreferences(pref);owner.ConfigurationChanged(false);Back();return;
+                }
+                else if(id==212)pref.LowBatteryNotifications=!pref.LowBatteryNotifications;
+                else if(id==214)pref.RememberReadings=!pref.RememberReadings;
+                else if(id==215)pref.ReducedMotion=!pref.ReducedMotion;
+                else if(id==219)pref.AutoCheckUpdates=!pref.AutoCheckUpdates;
+                else if(id==225)pref.ShowUpdateBadge=!pref.ShowUpdateBadge;
+                else if(id==226)pref.CheckFeedbackReplies=!pref.CheckFeedbackReplies;
+                else if(id==227)pref.IncludeBetaUpdates=!pref.IncludeBetaUpdates;
+                else if(id==217){owner.ClearReadingHistory();navigation.Notice="正在清除历史读数…";Invalidate();return;}
+                else if(id==218){pref.TrayDeviceId=pref.TrayDeviceId==control.DeviceKey?null:control.DeviceKey;}
+                else if(id>=252&&id<=255) {
+                    navigation.DeviceScroll=0;
+                    if(id==252)DeviceSettings.SetDeviceHidden(pref,control.DeviceKey,!pref.HiddenDeviceIds.Contains(control.DeviceKey));
+                    else {
+                        var cards=WirelessLayout.Build(owner,0,100000,true).All;var order=new List<string>();foreach(var card in cards)if(card.Id!="empty")order.Add(card.Id);
+                        int index=order.IndexOf(control.DeviceKey);if(index<0)return;DeviceSettings.MoveDevice(pref,control.DeviceKey,id==253?0:index+(id==254?-1:1),order);
+                    }
+                }
+                else if(id==220||id==221||id==222){EditAlias(id==220,id==222?navigation.SelectedDeviceKey:null);return;}
+                else if(id>=230&&id<=232){navigation.BindingRole=id==230?"speaker":id==231?"headset":"microphone";Go(PopupPage.PickBinding);return;}
+                else if(id==233){DeviceSettings.ResetAudioForDevice(navigation.AudioDeviceKey);owner.ConfigurationChanged();navigation.Notice=navigation.AudioDeviceKey==null?"已恢复自动识别":"已清除此设备的音频绑定";Invalidate();return;}
+                else if(id==7||id==8){navigation.Offset=control.PageOffset>=0?control.PageOffset:Math.Max(0,navigation.Offset+(id==7?-navigation.VisibleChoices:navigation.VisibleChoices));UpdateLayoutSize();Invalidate();return;}
+                else if(id>=300){DeviceSettings.SetEndpointForDevice(navigation.AudioDeviceKey,navigation.BindingRole,control.EndpointId);owner.ConfigurationChanged();Back();navigation.Notice="绑定已保存，当前音源未更改";Invalidate();return;}
+                else if(id==250){copyText(owner.DiagnosticSummary());navigation.Notice="已复制诊断摘要（不含序列号和路径）";Invalidate();return;}
+                else if(id==258){ShowFeedback();return;}
+                else if(id==262){ShowMyFeedback();return;}
+                else if(id==259){openLink("https://github.com/wushuai0802/myfinder-device-battery/blob/main/docs/compatibility.md");return;}
+                else return;
+                owner.SavePreferences(pref);owner.ConfigurationChanged(false);UpdateLayoutSize();Invalidate();
+            }catch(Exception error){navigation.Notice="未保存："+error.Message;Invalidate();}
+        }
+        void PerformTrayAction(PopupControl control,AudioBindings pref){
+            string action=control.ActionKey;
+            if(action=="tray:group"){navigation.TrayGroupKey=control.GroupKey;Go(PopupPage.TrayGroup);return;}
+            if(action=="tray:rules"){
+                if(navigation.TrayGroupKey==TrayConfiguration.FirstId){navigation.PreferenceAction=211;Go(PopupPage.ChoosePreference);}else Go(PopupPage.TrayRules);return;
+            }
+            if(action=="tray:members"){Go(PopupPage.TrayMembers);return;}
+            if(action=="tray:delete"){Go(PopupPage.ConfirmTrayDelete);return;}
+            if(action=="tray:rename"){EditAlias(false,null,control.GroupKey);UpdateLayoutSize();Invalidate();return;}
+            bool hint=false,back=false,deleted=false;
+            if(action=="tray:add"){TrayConfiguration.Add(pref);hint=!pref.TrayGroupHintShown;pref.TrayGroupHintShown=true;}
+            else if(action=="tray:confirm-delete"){TrayConfiguration.Remove(pref,control.GroupKey);deleted=true;}
+            else {
+                var group=TrayConfiguration.Find(pref,control.GroupKey);if(group==null)throw new InvalidOperationException("分组不存在");
+                if(action=="tray:member")TrayConfiguration.Move(pref,control.DeviceKey,group.Members.Contains(control.DeviceKey)?TrayConfiguration.FirstId:group.Id);
+                else if(action=="tray:rule"){group.Source=control.TargetToken=="active"?"active":"lowest";group.DeviceId=null;back=true;}
+                else if(action=="tray:group-pin"&&group.Members.Contains(control.DeviceKey)){group.DeviceId=control.DeviceKey;back=true;}
+                else return;
+            }
+            owner.SavePreferences(pref);owner.ConfigurationChanged(false);
+            if(hint)navigation.TrayHint=true;
+            if(deleted){Back();Back();navigation.TrayGroupKey=TrayConfiguration.FirstId;}else if(back)Back();
+            UpdateLayoutSize();Invalidate();
+        }
+        void SchedulePendingHint(){feedbackTimer.Stop();feedbackTimer.Start();}
+        internal void Notice(string text){navigation.Notice=text;Invalidate();}
+        internal void NoticeUpdated(){updatedNotice="已更新到 "+AppRuntime.Version;updatedNoticeTimer.Stop();updatedNoticeTimer.Start();Invalidate();}
+        void ShowFeedback(){
+            using(var dialog=new FeedbackForm(owner.CreateFeedbackReport(),navigation.Page==PopupPage.DeviceMissing,Style.Dark,copyText,openLink,feedbackReplies:owner.FeedbackReplies,openMyFeedback:owner.OpenMyFeedback)){
+                feedbackModal=true;ignoreDeactivate=true;CancelDeferredDeactivation();
+                try{dialog.ShowDialog(this);}finally{feedbackModal=false;ignoreDeactivate=false;}
+            }
+        }
+        void ShowMyFeedback(){
+            owner.OpenMyFeedback();
+        }
+        void EditAlias(bool mouse,string deviceKey=null,string groupKey=null) {
+            var pref=DeviceSettings.Current;
+            using(var dialog=new ThemedAliasDialog(groupKey!=null?"托盘图标名称":deviceKey!=null?"设备显示名称":mouse?"鼠标显示名称":"耳机显示名称",groupKey!=null?TrayConfiguration.Name(pref,groupKey):deviceKey!=null?navigation.SelectedDeviceName:mouse?pref.MouseAlias:pref.HeadsetAlias,groupKey!=null?12:32)) {
+                var input=dialog.Input;ignoreDeactivate=true;
+                try {if(dialog.ShowDialog(this)==DialogResult.OK){pref=DeviceSettings.Current;if(groupKey!=null){TrayConfiguration.Rename(pref,groupKey,input.Text);owner.SavePreferences(pref);}else {if(deviceKey!=null){pref.DeviceAliases[deviceKey]=input.Text;navigation.SelectedDeviceName=input.Text;}else if(mouse)pref.MouseAlias=input.Text;else pref.HeadsetAlias=input.Text;DeviceSettings.SaveConfiguration(pref);}owner.ConfigurationChanged(false);}}
+                finally{ignoreDeactivate=false;}
+            }
+        }
+        PointF PanelPoint(Point point) {return UiState.LogicalPoint(point,dpiScale);}
+        /// <summary>右键命中设备卡片后打开控制菜单（DPI/回报率/7.1/变声/降噪）。</summary>
+        internal void ShowCardContextMenu(Point clientPoint) {
+            if(closing||navigation.Page!=PopupPage.Main||!MainUsesDeviceLayout)return;
+            var layout=MainWireless();var panelPoint=PanelPoint(clientPoint);WirelessCard card=null;
+            foreach(var candidate in layout.Cards) {
+                if(candidate.Id=="empty")continue;
+                if(!candidate.Tile.IsEmpty) {if(candidate.Tile.Contains(panelPoint)){card=candidate;break;}}
+                else if(panelPoint.Y>=candidate.Top&&panelPoint.Y<=candidate.Top+candidate.Height&&panelPoint.X>=0&&panelPoint.X<=VisualDesign.PanelWidth){card=candidate;break;}
+            }
+            if(card==null) {
+                if(PopupPages.Hit(ControlsForPage(),panelPoint)!=null)return;
+            }
+            HidePointerTip();CancelPointerInteraction();
+            ignoreDeactivate=true;
+            DeviceControlMenu.Show(this,owner,card,PointToScreen(clientPoint),delegate {
+                ignoreDeactivate=false;
+                if(!IsDisposed&&IsHandleCreated)BeginInvoke((MethodInvoker)delegate{if(!IsDisposed&&IsHandleCreated)Activate();});
+            });
+        }
+        protected override bool ProcessCmdKey(ref Message message,Keys keys) {
+            if(keys==Keys.Escape||keys==Keys.Tab||keys==(Keys.Tab|Keys.Shift)||keys==Keys.Left||keys==Keys.Right||keys==Keys.Up||keys==Keys.Down||keys==Keys.Enter||keys==Keys.Space){keyboardFocusVisible=true;HidePointerTip();}
+            if(keys==Keys.Escape){if(navigation.Page==PopupPage.Main)CloseAnimated();else Back();return true;}
+            var controls=ControlsForPage();ReconcileKeyboardFocus(controls);var targets=new List<PopupControl>();foreach(var control in controls)if(control.Id>=0&&control.Enabled&&!control.Information)targets.Add(control);
+            if(navigation.Page==PopupPage.Main&&VisualDesign.GridLayout){
+                var layout=MainWireless();var tiles=targets.FindAll(delegate(PopupControl c){return !c.Viewport.HasValue&&c.Rect.Bottom<=layout.Grid.Controls.Top;});var current=tiles.Find(delegate(PopupControl c){return c.StableKey==keyboardFocusKey;});
+                if((current!=null||keyboardFocusKey==null)&&(keys==Keys.Left||keys==Keys.Right||keys==Keys.Up||keys==Keys.Down)){
+                    int dy=keys==Keys.Up?-1:keys==Keys.Down?1:0;var next=GridLayout.Spatial(tiles,current,keys==Keys.Left?-1:keys==Keys.Right?1:0,dy);
+                    if(next==current&&current!=null&&dy!=0&&(dy<0?layout.Start>0:layout.End<layout.All.Count)){
+                        int index=layout.All.FindIndex(delegate(WirelessCard card){return card.Id==current.DeviceKey;});string id=layout.All[Math.Max(0,Math.Min(layout.All.Count-1,index+dy*2))].Id;
+                        navigation.DeviceScroll=Math.Max(0,layout.Start+dy*2);CancelPointerInteraction();UpdateLayoutSize();next=ControlsForPage().Find(delegate(PopupControl c){return c.DeviceKey==id&&(c.Id==2||c.Id==3||c.Id==200||c.Id>=1000&&c.Id<2000);});
+                    }
+                    FocusControl(next);return true;
+                }
+                if(current!=null&&keys==Keys.Tab){FocusControl(targets.Find(delegate(PopupControl c){return c.Viewport.HasValue||c.Rect.Top>=layout.Grid.Controls.Top;}));return true;}
+            }
+            if(keyboardFocus==240&&(keys==Keys.Left||keys==Keys.Right)&&owner.Audio!=null&&owner.Audio.OutputVolumePercent.HasValue){var slider=controls.Find(delegate(PopupControl row){return row.Id==240&&row.Enabled&&row.Slider;});if(slider!=null)SetSliderValue(slider,(owner.DesiredVolume??owner.Audio.OutputVolumePercent.Value)+(keys==Keys.Left?-2:2));return true;}
+            if(keys==Keys.Tab||keys==(Keys.Tab|Keys.Shift)||keys==Keys.Right||keys==Keys.Left) {
+                if(targets.Count==0)return true;int direction=keys==(Keys.Tab|Keys.Shift)||keys==Keys.Left?-1:1,index=targets.FindIndex(delegate(PopupControl c){return c.StableKey==keyboardFocusKey;});
+                FocusControl(targets[(index<0?(direction>0?0:targets.Count-1):(index+direction+targets.Count)%targets.Count)]);return true;
+            }
+            if(keys==Keys.Enter||keys==Keys.Space) {
+                var target=RevealGridControl(PopupPages.FindStable(controls,keyboardFocusKey));if(target!=null&&target.Enabled&&!target.Information)PerformAction(target);
+                return true;
+            }
+            return base.ProcessCmdKey(ref message,keys);
+        }
+        void FocusControl(PopupControl control){if(navigation.Page==PopupPage.Main&&VisualDesign.GridLayout&&control!=null)control=RevealGridControl(PopupPages.FindStable(ControlsForPage(),control.StableKey));keyboardFocusVisible=true;HidePointerTip();keyboardFocus=control==null?-1:control.Id;keyboardFocusKey=control==null?null:control.StableKey;keyboardFocusIndex=control==null?0:ControlsForPage().FindIndex(delegate(PopupControl c){return c.StableKey==control.StableKey;});AccessibilityNotifyClients(AccessibleEvents.Focus,-1);Invalidate();}
+        void ReconcileKeyboardFocus(List<PopupControl> controls){if(keyboardFocus<0&&keyboardFocusKey==null)return;if(keyboardFocusKey==null){var previous=controls.Find(delegate(PopupControl c){return c.Id==keyboardFocus;});if(previous!=null)keyboardFocusKey=previous.StableKey;}
+            var next=navigation.Page==PopupPage.Main&&VisualDesign.GridLayout?PopupPages.FindStable(controls,keyboardFocusKey):PopupPages.ReconcileFocus(controls,keyboardFocusKey,keyboardFocusIndex);keyboardFocus=next==null?-1:next.Id;keyboardFocusKey=next==null?null:next.StableKey;}
+        protected override AccessibleObject CreateAccessibilityInstance(){return new PopupAccessibility(this,ControlsForPage,delegate{return keyboardFocus;},PerformAction,delegate{return dpiScale;},FocusControl,SetSliderValue);}
+        protected override void WndProc(ref Message message) {
+            if(message.Msg==0x001F){CancelPointerInteraction();Invalidate();}
+            if(message.Msg==0x02E0){dpiScale=Math.Max(1f,(message.WParam.ToInt64()&0xffff)/96f);UpdateLayoutSize();Invalidate();}
+            base.WndProc(ref message);
+        }
+        int AudioAtPoint(PointF point) {
+            if(headsetProgress<.98f||displayAudio==null)return -1;
+            if(displayAudio.SpeakerAvailable&&VisualDesign.SpeakerOutputRectFor(owner.Dpi).Contains(point))return 0;
+            if(displayAudio.HeadsetAvailable&&VisualDesign.HeadsetOutputRectFor(owner.Dpi).Contains(point))return 1;
+            if(displayAudio.MicrophoneAvailable&&displayAudio.MicrophoneMuted.HasValue&&VisualDesign.MicrophoneMuteRectFor(owner.Dpi).Contains(point))return 2;
+            return -1;
+        }
+        public void SyncDevices() {
+            bool layoutChanged=panelLayout!=DeviceSettings.Current.PanelLayout;panelLayout=DeviceSettings.Current.PanelLayout;
+            if(layoutChanged){CancelPointerInteraction();gridControlScroll=0;gridControlKey=null;gridFocusNeedsReveal=true;}
+            bool volumeChanged=volumeCollapsed!=DeviceSettings.Current.VolumeCollapsed;volumeCollapsed=DeviceSettings.Current.VolumeCollapsed;
+            if(draggingVolume&&(!VolumeTargetAvailable(volumeEndpoint)||navigation.Page==PopupPage.Main&&volumeCollapsed))CancelPointerInteraction();
+            if(volumeChanged){pageAnimation.Stop();pageProgress=1;}
+            if(!volumeChanged&&(MainUsesDeviceLayout||layoutChanged)&&navigation.Page==PopupPage.Main&&!pageAnimation.Enabled&&!PopupPages.Reduced&&(MainUsesDeviceLayout?MainWireless().Size.Height:VisualDesign.PanelSizeFor(VisualDesign.HasAudioCard(owner.Headset,owner.Audio),owner.Dpi).Height)!=targetSize.Height){pageStartHeight=targetSize.Height;pageProgress=0;pageClock.Restart();pageAnimation.Start();}
+            bool visible=VisualDesign.HasAudioCard(owner.Headset,owner.Audio);
+            displayAudio=owner.Audio;if(visible||headsetProgress==0f)displayHeadset=owner.Headset;
+            float next=visible?1f:0f;
+            if(next!=layoutTarget) {
+                layoutStart=headsetProgress;layoutTarget=next;
+                if(PopupPages.Reduced){headsetProgress=next;layoutAnimation.Stop();UpdateLayoutSize();}
+                else{layoutClock.Restart();layoutAnimation.Start();}
+            } else UpdateLayoutSize();
+            var controls=ControlsForPage();ReconcileKeyboardFocus(controls);
+            if(gridFocusNeedsReveal){gridFocusNeedsReveal=false;if(keyboardFocusVisible&&keyboardFocusKey!=null)FocusControl(PopupPages.FindStable(controls,keyboardFocusKey));}
+            AccessibilityNotifyClients(AccessibleEvents.Reorder,-1);
+            if(layoutChanged&&!layeredRendering)UpdateFallbackRegion();
+            Invalidate();
+        }
+        void UpdateLayoutSize() {
+            Size mouse=VisualDesign.PanelSizeFor(false,owner.Dpi),both=VisualDesign.PanelSizeFor(true,owner.Dpi);
+            targetSize=new Size(mouse.Width,mouse.Height+(int)Math.Round((both.Height-mouse.Height)*headsetProgress));
+            if(navigation.Page==PopupPage.Main&&MainUsesDeviceLayout)targetSize=MainWireless().Size;
+            if(navigation.Page!=PopupPage.Main)targetSize=PopupPages.SizeFor(ControlsForPage());
+            if(pageProgress<1f)targetSize.Height=(int)Math.Round(pageStartHeight+(targetSize.Height-pageStartHeight)*pageProgress);
+            Size physical=UiState.ScaleSize(targetSize,dpiScale);
+            var area=PanelWorkArea;physical=new Size(Math.Min(physical.Width,area.Width),Math.Min(physical.Height,area.Height));
+            if(ClientSize!=physical) {
+                ClientSize=physical;
+                if(!layeredRendering)UpdateFallbackRegion();
+            }
+            PositionForSize((int)Math.Round((1-animationProgress)*6));
+        }
+        void UpdateFallbackRegion() {
+            Region mask;
+            int panelWidth=VisualDesign.PanelWidth,footerHeight=VisualDesign.FooterHeight;
+            if(navigation.Page==PopupPage.Main&&VisualDesign.GridLayout){
+                mask=new Region();mask.MakeEmpty();var layout=MainWireless();foreach(var card in layout.Cards)using(var shape=Style.Round(card.Tile,VisualDesign.MainCardRadius))mask.Union(shape);
+                using(var shape=Style.Round(layout.Grid.Controls,VisualDesign.MainCardRadius))mask.Union(shape);mask.Union(new RectangleF(0,layout.Footer,panelWidth,footerHeight));
+            }else if(navigation.Page==PopupPage.Main&&VisualDesign.RingLayout) {
+                float bottom=owner.UseWirelessLayout?MainWireless().VolumeRect.Bottom:VisualDesign.MouseCardHeight(owner.Dpi)+VisualDesign.SecondCardStep*headsetProgress+VisualDesign.DeviceGap+VisualDesign.CurrentSystemVolumeHeight;
+                using(var shape=Style.Round(new RectangleF(0,0,panelWidth,bottom),14))mask=new Region(shape);
+                mask.Union(new RectangleF(0,bottom+VisualDesign.MainFooterGap,panelWidth,footerHeight));
+            }else if(navigation.Page==PopupPage.Main&&owner.UseWirelessLayout) {
+                mask=new Region();mask.MakeEmpty();var layout=MainWireless();foreach(var card in layout.Cards)using(var shape=Style.Round(new RectangleF(0,card.Top,panelWidth,card.Height),VisualDesign.MainCardRadius))mask.Union(shape);
+                if(layout.HasVolume)using(var shape=Style.Round(layout.VolumeRect,VisualDesign.MainCardRadius))mask.Union(shape);
+                mask.Union(new RectangleF(0,layout.Footer,panelWidth,footerHeight));
+            }else{
+            int mouse=VisualDesign.MouseCardHeight(owner.Dpi),headsetTop=mouse+8;
+            using(var shape=Style.Round(new RectangleF(0,0,targetSize.Width,navigation.Page==PopupPage.Main?mouse:targetSize.Height),navigation.Page==PopupPage.Main?VisualDesign.MainCardRadius:VisualDesign.PanelRadius))mask=new Region(shape);
+            if(navigation.Page==PopupPage.Main) {
+                float height=Math.Max(1,VisualDesign.HeadsetCardHeight*headsetProgress);
+                if(headsetProgress>0f)using(var shape=Style.Round(new RectangleF(0,headsetTop,targetSize.Width,height),Math.Min(VisualDesign.MainCardRadius,height/2)))mask.Union(shape);
+                float volumeTop=mouse+VisualDesign.SecondCardStep*headsetProgress+VisualDesign.CardGap;
+                using(var shape=Style.Round(new RectangleF(0,volumeTop,targetSize.Width,VisualDesign.CurrentSystemVolumeHeight),VisualDesign.MainCardRadius))mask.Union(shape);
+                mask.Union(new RectangleF(0,volumeTop+VisualDesign.CurrentSystemVolumeHeight,targetSize.Width,footerHeight));
+            }
+            }
+            using(var transform=new Matrix()){transform.Scale(dpiScale,dpiScale);mask.Transform(transform);}
+            var previous=Region;Region=mask;if(previous!=null)previous.Dispose();
+        }
+        void AdvanceLayout() {
+            float elapsed=Math.Min(1f,(float)layoutClock.Elapsed.TotalMilliseconds/160f);
+            float eased=1f-(float)Math.Pow(1f-elapsed,3);
+            headsetProgress=layoutStart+(layoutTarget-layoutStart)*eased;
+            if(elapsed>=1f){headsetProgress=layoutTarget;layoutAnimation.Stop();layoutClock.Stop();if(headsetProgress==0f){displayHeadset=owner.Headset;displayAudio=owner.Audio;}}
+            UpdateLayoutSize();Invalidate();
+        }
+        protected override bool ShowWithoutActivation {get{return false;}}
+        protected override CreateParams CreateParams {
+            get {var p=base.CreateParams;p.ExStyle|=0x80|0x80000;return p;}
+        }
+        bool LivePopupHandle {get{return !disposingPopup&&!Disposing&&!IsDisposed&&IsHandleCreated&&owner!=null&&owner.OwnsDetails(this);}}
+        int BeginPresentation(){presentationEpoch++;ignoreDeactivate=true;CancelDeferredDeactivation();return presentationEpoch;}
+        void QueueOpeningGuardRelease(int epoch) {
+            if(presentationDepth!=0||!LivePopupHandle||epoch!=presentationEpoch)return;IntPtr handle=Handle;
+            BeginInvoke((MethodInvoker)delegate {if(LivePopupHandle&&epoch==presentationEpoch&&Handle==handle&&!feedbackModal)ignoreDeactivate=false;});
+        }
+        protected override void OnHandleDestroyed(EventArgs e) {
+            presentationEpoch++;CancelDeferredDeactivation();base.OnHandleDestroyed(e);
+        }
+        protected override void OnHandleCreated(EventArgs e) {
+            base.OnHandleCreated(e);if(ignoreDeactivate)QueueOpeningGuardRelease(presentationEpoch);
+        }
+        public void OpenAnimated(bool fromLauncher=false) {OpenAnimatedCore(fromLauncher,null);}
+        internal void OpenFromTray(Point point){OpenAnimatedCore(false,null,point);}
+        internal void OpenUpdated(TrayPanelAnchor placement){OpenAnimatedCore(false,placement);}
+        void OpenAnimatedCore(bool fromLauncher,TrayPanelAnchor? placement,Point? click=null) {
+            if(disposingPopup||Disposing||IsDisposed)return;
+            presentationDepth++;
+            try {
+                BeginPresentation();updatedAnchor=placement;anchor=placement.HasValue?placement.Value.Point:click??owner.CursorPosition();
+                if(!placement.HasValue&&fromLauncher){var screen=PanelWorkArea;anchor=new Point(screen.Right-24,screen.Top+16);}
+                dpiScale=NativeDisplay.ScaleAt(anchor);ResetPage();UpdateLayoutSize();closing=false;ignoreDeactivate=true;animationProgress=0;BeginBatteryOpening();
+                frameAlpha=3;PositionForSize(6);Show();Activate();owner.PanelOpened();AnimateTo(1f,190f);
+            } finally {
+                // Native Show/Activate can pump HandleCreated callbacks before setup finishes.
+                // Keep deactivation guarded until the outermost presentation has returned.
+                presentationDepth--;if(presentationDepth==0)QueueOpeningGuardRelease(presentationEpoch);
+            }
+        }
+        void PositionForSize(int slideY) {
+            if(updatedAnchor.HasValue){var placement=updatedAnchor.Value;Location=TrayPanelPlacement.Position(anchor,placement.WorkArea,Size,placement.Edge);return;}
+            var screen=PanelWorkArea;
+            int margin=(int)Math.Round(8*dpiScale);
+            int x=Math.Max(screen.Left+margin,Math.Min(anchor.X-Width/2,screen.Right-Width-margin));
+            int y=anchor.Y<screen.Top+100*dpiScale?screen.Top+margin:anchor.Y-Height-(int)(14*dpiScale);
+            y+=(int)Math.Round(slideY*dpiScale);
+            y=Math.Max(screen.Top+margin,Math.Min(y,screen.Bottom-Height-margin));
+            // A size-capped panel may have less than a full margin available.
+            Location=new Point(Math.Max(screen.Left,Math.Min(x,screen.Right-Width)),Math.Max(screen.Top,Math.Min(y,screen.Bottom-Height)));
+        }
+        public void Reveal() {
+            if(disposingPopup||Disposing||IsDisposed)return;
+            presentationDepth++;
+            try {
+                BeginPresentation();ResetPage();
+                if(closing){closing=false;BeginBatteryOpening();owner.PanelOpened();AnimateTo(1f,190f);}
+                Show();Activate();
+            } finally {presentationDepth--;if(presentationDepth==0)QueueOpeningGuardRelease(presentationEpoch);}
+        }
+        internal bool IsClosing {get{return closing;}}
+        internal bool DeferredDeactivationPending {get{return deferredDeactivation;}}
+        internal void HandleDeactivation() {
+            if(ignoreDeactivate||closing||!LivePopupHandle)return;
+            CancelPointerInteraction();
+            CancelDeferredDeactivation();
+            // A tray press can deactivate us before NotifyIcon receives MouseDown.
+            // Keep the popup until release so that press can capture a close intent.
+            deferredDeactivation=true;
+            if(owner.LeftButtonPressed)deactivateRelease.Start();
+            else CheckDeferredDeactivation();
+        }
+        internal void CancelDeferredDeactivation() {
+            deferredDeactivation=false;deactivationEpoch++;
+            if(!disposingPopup&&!Disposing&&!IsDisposed)deactivateRelease.Stop();
+        }
+        internal void CheckDeferredDeactivation() {
+            if(!LivePopupHandle){CancelDeferredDeactivation();return;}
+            if(!deferredDeactivation||owner.LeftButtonPressed)return;
+            deactivateRelease.Stop();int epoch=deactivationEpoch,shown=presentationEpoch;IntPtr handle=Handle;
+            BeginInvoke((MethodInvoker)delegate {
+                if(LivePopupHandle&&Handle==handle&&shown==presentationEpoch&&deferredDeactivation&&epoch==deactivationEpoch)CloseAnimated();
+            });
+        }
+        public void CloseAnimated() {
+            if(disposingPopup||Disposing||IsDisposed)return;
+            CancelPointerInteraction();HidePointerTip();CancelDeferredDeactivation();if(closing)return;closing=true;batteryOpening=false;batteryProgress=1;owner.SetAudioScope(null);owner.PanelClosed();AnimateTo(0f,135f);
+        }
+        public void ToggleAnimated() {
+            if(closing)Reveal();
+            else CloseAnimated();
+        }
+        void ResetPage(){updatedNotice=null;updatedNoticeTimer.Stop();CancelPointerInteraction();gridControlScroll=0;gridControlKey=null;gridFocusNeedsReveal=false;navigation.Reset();SyncAudioScope();keyboardFocus=-1;keyboardFocusKey=null;keyboardFocusVisible=false;hoverAction=-1;hoverStage=-1;hoverAudio=-1;hoverRefresh=false;hoverSettings=false;HidePointerTip();pageAnimation.Stop();pageProgress=1;UpdateLayoutSize();}
+        void BeginBatteryOpening(){batteryOpening=!PopupPages.Reduced;batteryProgress=batteryOpening?0:1;}
+        void AnimateTo(float target,float durationMs) {
+            if(PopupPages.Reduced){animationProgress=target;batteryOpening=false;batteryProgress=1;frameAlpha=target>0? (byte)255:(byte)0;animation.Stop();motionClock.Stop();if(target==0&&closing){Hide();Dispose();return;}if(!layeredRendering)Opacity=1;Invalidate();return;}
+            motionStart=animationProgress;motionTarget=target;
+            motionDurationMs=Math.Max(60f,durationMs*Math.Abs(target-animationProgress));
+            motionClock.Restart();animation.Start();
+        }
+        void AdvanceAnimation() {
+            AdvanceMotion((float)motionClock.Elapsed.TotalMilliseconds);
+        }
+        void AdvanceMotion(float elapsedMs) {
+            if(disposingPopup||Disposing||IsDisposed||!animation.Enabled)return;
+            bool reduced=PopupPages.Reduced;
+            float progress=reduced?1:Math.Min(1f,elapsedMs/motionDurationMs);
+            float eased=1f-(float)Math.Pow(1f-progress,3);
+            animationProgress=motionStart+(motionTarget-motionStart)*eased;
+            if(batteryOpening){batteryProgress=VisualDesign.BatteryOpeningProgress(elapsedMs,reduced);if(batteryProgress>=1)batteryOpening=false;}
+            if(progress>=1f){animationProgress=motionTarget;if(!batteryOpening){animation.Stop();motionClock.Stop();}}
+            if(animationProgress<=0f&&closing){Hide();Dispose();return;}
+            PositionForSize((int)Math.Round((1-animationProgress)*6));frameAlpha=(byte)Math.Round(3+252*animationProgress);
+            if(!layeredRendering)Opacity=.01+.99*animationProgress;
+            Invalidate();
+        }
+        protected override void Dispose(bool disposing) {
+            if(disposing&&!disposingPopup)updatedNoticeTimer.Dispose();
+            if(disposing&&!disposingPopup){disposingPopup=true;batteryOpening=false;batteryProgress=1;motionClock.Stop();presentationEpoch++;ignoreDeactivate=true;CancelPointerInteraction();lastHoverTip=null;owner.SetAudioScope(null);CancelDeferredDeactivation();deactivateRelease.Stop();deactivateRelease.Dispose();owner.PanelClosed();animation.Stop();animation.Dispose();layoutAnimation.Stop();layoutAnimation.Dispose();feedbackTimer.Stop();feedbackTimer.Dispose();pageAnimation.Stop();pageAnimation.Dispose();controlTip.Dispose();}
+            base.Dispose(disposing);
+        }
+        protected override void OnPaintBackground(PaintEventArgs e) {if(!layeredRendering)base.OnPaintBackground(e);}
+        public new void Invalidate() {
+            // Per-pixel layered windows do not rely on WM_PAINT to publish
+            // their initial surface. Present each visual update explicitly.
+            if(layeredRendering&&IsHandleCreated&&!disposingPopup&&!Disposing&&!IsDisposed&&Visible) {
+                if(RenderLayeredFrame())return;
+                layeredRendering=false;
+                UpdateFallbackRegion();
+                Opacity=Math.Max(.01,frameAlpha/255d);
+            }
+            base.Invalidate();
+        }
+        protected override void OnPaint(PaintEventArgs e) {
+            base.OnPaint(e);
+            if(layeredRendering&&RenderLayeredFrame())return;
+            if(layeredRendering) {
+                layeredRendering=false;
+                UpdateFallbackRegion();
+                Opacity=Math.Max(.01,frameAlpha/255d);
+            }
+            var saved=e.Graphics.Save();e.Graphics.ScaleTransform(dpiScale,dpiScale);
+            PaintContent(e.Graphics);
+            e.Graphics.Restore(saved);
+        }
+        void PaintContent(Graphics g) {
+            var saved=g.Save();
+            if(navigation.Page!=PopupPage.Main){g.TranslateTransform(8*(1-pageProgress),0);PopupPages.Paint(g,owner,navigation,ControlsForPage(),Style.Dark,hoverAction,pressedAction,keyboardFocusVisible?keyboardFocus:-1);}
+            else if(MainUsesDeviceLayout)CompactRenderer.PaintWireless(g,owner,MainWireless(),Style.Dark,Feedback(),batteryProgress);
+            else VisualDesign.PaintDevicesPanel(g,owner.Current,owner.LastGood,owner.ErrorMessage,owner.IsRefreshing,owner.Dpi,owner.DpiError,owner.IsDpiRefreshing,Style.Dark,displayHeadset,displayAudio,animationProgress,hoverStage,hoverRefresh,headsetProgress,hoverAudio,Feedback(),hoverSettings,batteryProgress);
+            g.Restore(saved);
+        }
+        bool RenderLayeredFrame() {
+            var feedback=Feedback();DateTime now=DateTime.UtcNow;
+            var shown=owner.Current??owner.LastGood;
+            var visible=new StringBuilder();
+            visible.Append(ClientSize).Append('|').Append(Left).Append('|').Append(Top).Append('|').Append(frameAlpha).Append('|').Append(animationProgress.ToString("F4",System.Globalization.CultureInfo.InvariantCulture));
+            // Preserve the exact final frame (not a rounded 99.99% arc with end caps).
+            visible.Append('|').Append(batteryProgress.ToString("R",System.Globalization.CultureInfo.InvariantCulture));
+            visible.Append('|').Append(Style.Dark).Append('|').Append(hoverStage).Append('|').Append(hoverRefresh);
+            visible.Append('|').Append(owner.Current!=null).Append('|').Append(shown==null?-1:shown.Percent).Append('|').Append(owner.Current!=null&&owner.Current.Charging);
+            if(owner.Current==null&&owner.LastGood!=null)visible.Append('|').Append(owner.LastGood.TimestampUtc.ToLocalTime().ToString("HH:mm"));
+            visible.Append('|').Append(owner.IsRefreshing&&owner.Current==null&&owner.LastGood==null).Append('|').Append(owner.IsDpiRefreshing).Append('|').Append(!String.IsNullOrEmpty(owner.DpiError));
+            if(owner.Dpi!=null){visible.Append('|').Append(owner.Dpi.ActiveStage);foreach(var stage in owner.Dpi.Stages)visible.Append('|').Append(stage.XDpi).Append('/').Append(stage.YDpi);}
+            visible.Append('|').Append(headsetProgress.ToString("F4",System.Globalization.CultureInfo.InvariantCulture));
+            if(displayHeadset!=null)visible.Append('|').Append(displayHeadset.Connected).Append('|').Append(displayHeadset.ConnectionVerified).Append('|').Append(displayHeadset.Percent).Append('|').Append(displayHeadset.Charging);
+            if(displayAudio!=null)visible.Append('|').Append(displayAudio.ActiveOutput).Append('|').Append(displayAudio.MicrophoneMuted).Append('|').Append(displayAudio.SpeakerAvailable).Append('|').Append(displayAudio.HeadsetAvailable).Append('|').Append(displayAudio.Error);
+            visible.Append('|').Append(hoverAudio);
+            visible.Append('|').Append(hoverSettings).Append('|').Append(feedback.Key);
+            var preferences=DeviceSettings.Current;
+            visible.Append('|').Append(navigation.Page).Append('|').Append(navigation.Offset).Append('|').Append(navigation.Notice).Append('|').Append(navigation.VolumePreview).Append('|').Append(pageProgress);
+            visible.Append('|').Append(navigation.AudioDeviceKey).Append('|').Append(navigation.AudioDeviceName);
+            visible.Append('|').Append(preferences.MouseAlias).Append('|').Append(preferences.HeadsetAlias).Append('|').Append(preferences.Theme).Append('|').Append(preferences.ThemeStyle).Append('|').Append(preferences.FontSize).Append('|').Append(preferences.TraySource).Append('|').Append(preferences.TrayDeviceId).Append('|').Append(preferences.LowBatteryNotifications).Append('|').Append(preferences.WarningThreshold).Append('|').Append(preferences.RememberReadings).Append('|').Append(preferences.ReducedMotion).Append('|').Append(preferences.BackgroundSeconds);
+            visible.Append('|').Append(preferences.VolumeCollapsed);
+            visible.Append('|').Append(preferences.PanelLayout);
+            visible.Append('|').Append(gridControlScroll);
+            visible.Append('|').Append(preferences.AutoCheckUpdates).Append('|').Append(preferences.ShowUpdateBadge).Append('|').Append(preferences.IncludeBetaUpdates).Append('|').Append(owner.UpdateStatus).Append('|').Append(owner.UpdateDotColor.ToArgb()).Append('|').Append(preferences.CheckFeedbackReplies).Append('|').Append(owner.FeedbackReplies.Store.Unread);
+            visible.Append('|').Append(preferences.TrayIconStyle).Append('|').Append(navigation.TrayGroupKey).Append('|').Append(navigation.TrayHint);
+            foreach(var group in preferences.TrayGroups){visible.Append('|').Append(group.Id).Append('|').Append(group.Name).Append('|').Append(group.Source).Append('|').Append(group.DeviceId);foreach(string id in group.Members)visible.Append('|').Append(id);}
+            if(owner.Audio!=null)visible.Append('|').Append(owner.Audio.OutputVolumePercent).Append('|').Append(owner.Audio.VolumeEndpointId);
+            if(owner.Audio!=null&&owner.Audio.Devices!=null)foreach(var device in owner.Audio.Devices)visible.Append('|').Append(device.Id).Append('|').Append(device.Name).Append('|').Append(device.FormFactor);
+            visible.Append('|').Append(owner.DesiredVolume).Append('|').Append(hoverAction).Append('|').Append(pressedAction);
+            visible.Append('|').Append(owner.NativeMousePresent).Append('|').Append(owner.GenericReady).Append('|').Append(owner.GenericScanning).Append('|').Append(navigation.DeviceScroll).Append('|').Append(navigation.SelectedDeviceKey).Append('|').Append(navigation.SelectedDeviceName);
+            visible.Append('|').Append(owner.WirelessDpiPresentationKey);
+            foreach(var device in owner.WirelessDevices){visible.Append('|').Append(device.Key);string alias;if(preferences.DeviceAliases.TryGetValue(device.Id,out alias))visible.Append('|').Append(alias);}
+            foreach(string id in preferences.HiddenDeviceIds)visible.Append("|hidden:").Append(id);
+            foreach(string id in preferences.DeviceOrder)visible.Append("|order:").Append(id);
+            visible.Append('|').Append(UiState.Mouse(owner.Current,owner.LastGood,now).Key).Append('|').Append(UiState.Headset(displayHeadset,now).Key);
+            visible.Append('|').Append(UiState.SyncText(UiState.Mouse(owner.Current,owner.LastGood,now),now)).Append('|').Append(owner.NativeDpiToken);
+            if(navigation.Page==PopupPage.Diagnostics)visible.Append('|').Append(owner.StorageHealthText);
+            if(displayAudio!=null)visible.Append('|').Append(displayAudio.MicrophoneAvailable);
+            string key=visible.ToString();
+            if(key==lastPresentedKey)return true;
+            using(var bitmap=new Bitmap(ClientSize.Width,ClientSize.Height,PixelFormat.Format32bppPArgb)) {
+                using(var g=Graphics.FromImage(bitmap)) {
+                    g.Clear(Color.Transparent);g.ScaleTransform(dpiScale,dpiScale);
+                    PaintContent(g);
+                }
+                IntPtr screen=GetDC(IntPtr.Zero),memory=IntPtr.Zero,image=IntPtr.Zero,previous=IntPtr.Zero;
+                try {
+                    memory=CreateCompatibleDC(screen);image=bitmap.GetHbitmap(Color.FromArgb(0));previous=SelectObject(memory,image);
+                    var position=new NativePoint(Left,Top);var size=new NativeSize(ClientSize.Width,ClientSize.Height);var origin=new NativePoint(0,0);
+                    var blend=new NativeBlend {Operation=0,Flags=0,Alpha=frameAlpha,Format=1};
+                    bool presented=UpdateLayeredWindow(Handle,screen,ref position,ref size,memory,ref origin,0,ref blend,2);
+                    if(!presented&&Marshal.GetLastWin32Error()==87) {
+                        // WinForms can initialize a uniform-alpha layered window.
+                        // Reset only this popup's layer before switching to ARGB.
+                        long style=GetWindowLongPtr(Handle,-20).ToInt64();
+                        SetWindowLongPtr(Handle,-20,new IntPtr(style&~0x80000L));SetWindowLongPtr(Handle,-20,new IntPtr(style|0x80000L));
+                        presented=UpdateLayeredWindow(Handle,screen,ref position,ref size,memory,ref origin,0,ref blend,2);
+                    }
+                    if(presented)lastPresentedKey=key;
+                    if(owner.DiagnosticsEnabled&&!renderPreviewSaved&&frameAlpha==255&&!layoutAnimation.Enabled&&owner.Current!=null&&owner.Dpi!=null) {
+                        try {
+                            Directory.CreateDirectory(DeviceSettings.DataDirectory);
+                            bitmap.Save(Path.Combine(DeviceSettings.DataDirectory,"active-ui-render.png"),ImageFormat.Png);
+                            File.WriteAllText(Path.Combine(DeviceSettings.DataDirectory,"visual-status.json"),"{\"layeredCompositor\":"+presented.ToString().ToLower()+",\"kind\":\"program-render\",\"percent\":"+owner.Current.Percent+",\"nativeTraySize\":"+SystemInformation.SmallIconSize.Width+"}");
+                            renderPreviewSaved=true;
+                        } catch(IOException) {}catch(UnauthorizedAccessException){}
+                    }
+                    return presented;
+                } finally {
+                    if(previous!=IntPtr.Zero)SelectObject(memory,previous);if(image!=IntPtr.Zero)DeleteObject(image);
+                    if(memory!=IntPtr.Zero)DeleteDC(memory);if(screen!=IntPtr.Zero)ReleaseDC(IntPtr.Zero,screen);
+                }
+            }
+        }
+        PanelFeedback Feedback(){var value=owner.GetFeedback();value.UpdatedNotice=updatedNotice;value.KeyboardFocus=keyboardFocusVisible?keyboardFocus:-1;value.HoverAction=hoverAction;value.PressedAction=pressedAction;value.VolumePreview=navigation.VolumePreview>=0?navigation.VolumePreview:owner.DesiredVolume??-1;return value;}
+        static RectangleF StageRect(int index,int count) {
+            return VisualDesign.StageRect(index,count);
+        }
+        static int StageAtPoint(PointF point,DpiConfig dpi) {
+            if(dpi==null||dpi.Stages==null)return -1;
+            for(int i=0;i<dpi.Stages.Count;i++)if(StageRect(i,dpi.Stages.Count).Contains(point))return i;
+            return -1;
+        }
+        public static void PaintPanel(Graphics g,BatteryReading current,BatteryReading lastGood,string error,bool busy,DpiConfig dpi,string dpiError,bool dpiBusy,bool dark,float openProgress=1f) {
+            VisualDesign.PaintPanel(g,current,lastGood,error,busy,dpi,dpiError,dpiBusy,dark,openProgress);
+        }
+    }
+    public sealed class TrayContext:ApplicationContext {
+        UpdateController updates;
+        DevicePackManager devicePacks;
+        DevicePackController devicePackChecks;
+        internal string DevicePackDiagnostic {get{return devicePacks==null?DevicePackManager.NotUsedDiagnostic:devicePacks.Diagnostic;}}
+        readonly TrayBalloonRoute balloonRoute=new TrayBalloonRoute();
+        internal FeedbackReplies FeedbackReplies=new FeedbackReplies(new FeedbackStore(null),new FeedbackHttp());
+        FeedbackReplyController feedbackChecks;MyFeedbackDialog feedbackDialog;
+        internal void OpenMyFeedback(long number=0){
+            if(feedbackDialog!=null&&!feedbackDialog.IsDisposed){feedbackDialog.Reload(number);DialogVisibility.RestoreAndActivate(feedbackDialog);return;}
+            feedbackDialog=new MyFeedbackDialog(FeedbackReplies,CreateFeedbackReport(),Style.Dark,selected:number);feedbackDialog.Show();
+        }
+        internal string UpdateStatus {get{return updates==null?"尚未检查":updates.Status;}}
+        internal string UpdateFailure {get{return updates==null?null:updates.LastFailure;}}
+        internal bool UpdateAvailable {get{return updates!=null&&updates.Available;}}
+        internal Color UpdateDotColor {get;private set;}
+        internal void OpenUpdate(){if(updates!=null)updates.Open();}
+        internal void CheckUpdates(){if(devicePackChecks!=null)devicePackChecks.Check(false);if(updates!=null)updates.Check(false);}
+        readonly NotifyIcon tray=new NotifyIcon();
+        readonly TrayIconSet trayIcons;
+        readonly Dictionary<string,string> groupDeviceKeys=new Dictionary<string,string>(StringComparer.Ordinal);
+        readonly System.Windows.Forms.Timer refresh=new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer liveSync=new System.Windows.Forms.Timer();
+        readonly Control dispatch=new Control();
+        UpdatedPanelRequest updatedPanelRequest;
+        bool updatedNoticeShown;
+        readonly Func<bool,MouseSnapshot> readSnapshot;
+        readonly Func<int,DpiConfig> selectStage;
+        readonly Func<NativeDpiRequest,DpiConfig> writeNativeDpi;
+        readonly Func<HeadsetReading> readHeadset;
+        readonly Func<AudioReading> readAudio;
+        readonly Func<string,AudioReading> writeOutput;
+        readonly Func<bool,AudioReading> writeMute;
+        readonly Func<string,int,AudioReading> writeVolume;
+        readonly Func<AudioCommand,AudioReading> writeAudioCommand;
+        readonly Func<bool> readLeftButton;
+        bool trayPressPending,trayPressCloses;
+        Details trayPressTarget;
+        readonly ToolStripMenuItem audioSettingsMenu=new ToolStripMenuItem("音源设置");
+        readonly System.Windows.Forms.Timer deviceDebounce=new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer expiryTimer=new System.Windows.Forms.Timer(),audioDebounce=new System.Windows.Forms.Timer(),operationTimer=new System.Windows.Forms.Timer();
+        readonly SnapshotWriter fileWriter=new SnapshotWriter();
+        readonly LowBatteryPolicy lowBattery=new LowBatteryPolicy();
+        readonly bool persistStatus;
+        GenericBatteryWorker genericWorker;
+        int genericBusy;
+        bool genericQueued;string genericQueuedTarget,genericTarget;
+        readonly Queue<WirelessDpiRequest> pendingWirelessDpi=new Queue<WirelessDpiRequest>();
+        WirelessDpiRequest wirelessDpiInFlight;
+        bool wirelessDpiNeedsReconcile;
+        int wirelessDpiGeneration,wirelessDpiEpoch;
+        sealed class DpiFailureState {internal string Token,Error;internal DateTime At;}
+        readonly Dictionary<string,DpiFailureState> wirelessDpiFailures=new Dictionary<string,DpiFailureState>(StringComparer.Ordinal);
+        WirelessDpiResult lastWirelessDpiResult;
+        int historyGeneration;bool clearingHistory;
+        DateTime genericChecked=DateTime.MinValue;
+        readonly Dictionary<string,WirelessDevice> wirelessCache=new Dictionary<string,WirelessDevice>();
+        public WirelessDevice[] WirelessDevices=new WirelessDevice[0];
+        UnadaptedDevice[] unadaptedDevices=new UnadaptedDevice[0];
+        SuppressedDevice[] suppressedDevices=new SuppressedDevice[0];
+        public bool NativeMousePresent=true,GenericReady;
+        public string GenericError;
+        public string GenericHealthSummary;
+        public int GenericFailureCount;
+        public string GenericIdleSummary;
+        public int GenericIdleCount;
+        public ReaderHealth[] GenericHealth=new ReaderHealth[0];
+        public bool GenericScanning {get{return genericBusy!=0;}}
+        public bool UseWirelessLayout {get{return GenericReady||!NativeMousePresent||WirelessDevices.Length>0||DeviceSettings.Current.HiddenDeviceIds.Count>0||DeviceSettings.Current.DeviceOrder.Count>0;}}
+        DeviceEventsWindow deviceEvents;
+        MouseActivityListener mouseActivity;
+        readonly ActivityRefreshPolicy activityRefresh=new ActivityRefreshPolicy();
+        readonly System.Windows.Forms.Timer activityTimer=new System.Windows.Forms.Timer();
+        readonly Func<DateTime> activityClock;
+        ActivityRefreshRequest nativeActivityInFlight,genericActivityInFlight;
+        string genericPhysicalTarget;
+        bool applyingPhysicalSnapshot;
+        string activityListenerState="not_started";
+        AudioControl.NotificationListener audioEvents;
+        bool sessionLocked,audioNeedsReconcile;
+        string trayDeviceKey;
+        string activePhysicalId;
+        bool activeNative;
+        DateTime activeSwitchedAt=DateTime.MinValue;
+        readonly Action<AudioBindings> saveConfiguration;
+        internal Func<Point> CursorPosition=delegate{return Cursor.Position;};
+        DateTime audioOperationStarted;
+        bool pendingHeadsetRefresh,manualRefresh;
+        int stageInFlight=-1;
+        string audioTargetInFlight,dpiActionFailure,audioActionFailure;
+        DateTime dpiFailureAt,audioFailureAt;
+        bool pendingAudioRefresh;
+        int headsetBusy,audioBusy,headsetFailures;
+        DateTime headsetCheckedUtc=DateTime.MinValue,audioCheckedUtc=DateTime.MinValue;
+        HeadsetReading lastKnownHeadset;
+        string pendingAudioOutput;
+        bool? pendingMicrophoneMute;
+        bool? microphoneTargetInFlight;
+        int? pendingVolume,volumeTargetInFlight;
+        string pendingVolumeEndpoint;
+        AudioCommand pendingOutputCommand,pendingMuteCommand,pendingVolumeCommand;
+        int audioGeneration;
+        string audioScopeDeviceId;
+        DateTime actionRequestedAt;
+        Details details;int busy;volatile bool disposed;
+        bool switching,panelOpen,pendingRead,pendingBattery;
+        int pendingStage=-1;
+        NativeDpiRequest pendingNativeDpi;
+        int nativeEpoch,discardedNativeResults;
+        bool nativeNeedsReconcile;
+        string nativeDeviceKey;
+        readonly string instanceId=Guid.NewGuid().ToString("N");
+        readonly int processId=Process.GetCurrentProcess().Id;
+        readonly DateTime processStartedAtUtc=Process.GetCurrentProcess().StartTime.ToUniversalTime();
+        DateTime lastSyncUtc=DateTime.MinValue;
+        int completedReads,completedSwitches;
+        int iconUpdates;
+        public BatteryReading Current,LastGood;
+        public DpiConfig Dpi;
+        public HeadsetReading Headset;
+        public AudioReading Audio;
+        public string ErrorMessage="Not yet read";
+        public string DpiError="";
+        public bool IsRefreshing {get{return busy!=0;}}
+        public bool IsDpiRefreshing {get{return switching||pendingStage>=0;}}
+        public bool IsAudioBusy {get{return audioBusy!=0;}}
+        public bool IsHeadsetRefreshing {get{return headsetBusy!=0;}}
+        public bool AudioControlsAvailable {get{return !audioNeedsReconcile;}}
+        public string AudioScopeDeviceId {get{return audioScopeDeviceId;}}
+        public AudioBindings AudioScopeSettings {get{return DeviceSettings.ForAudioDevice(audioScopeDeviceId);}}
+        public int? DesiredVolume {get{return pendingVolume??volumeTargetInFlight;}}
+        internal bool DiagnosticsEnabled {get{return persistStatus;}}
+        internal bool NativeDpiVerified {get{return !nativeNeedsReconcile&&NativeMousePresent&&Dpi!=null&&Dpi.Stages!=null&&Dpi.Stages.Count>0&&Dpi.Stages.Count<=8&&Dpi.ActiveStage>=0&&Dpi.ActiveStage<Dpi.Stages.Count&&MouseBattery.ValidDeviceKey(Dpi.DeviceKey)&&String.IsNullOrEmpty(DpiError)&&UiState.Recent(Dpi.TimestampUtc,DateTime.UtcNow,90);}}
+        internal bool CanSetNativeDpi {get{return !disposed&&!sessionLocked&&NativeDpiVerified;}}
+        internal string NativeDpiToken {get{if(!CanSetNativeDpi)return null;var key=new StringBuilder(Dpi.DeviceKey+"@"+nativeEpoch);foreach(var stage in Dpi.Stages)key.Append('|').Append(stage.XDpi).Append('/').Append(stage.YDpi);return key.ToString();}}
+        internal string StorageHealthText {get{return fileWriter.GetHealth(Path.Combine(DeviceSettings.DataDirectory,"status.json")).Describe(DateTime.UtcNow);}}
+        static MouseSnapshot ReadWithRetry(bool includeBattery) {
+            MouseSnapshot result=null;
+            for(int attempt=0;attempt<2;attempt++) {
+                try {
+                    var next=MouseBattery.ReadSnapshot(includeBattery&&(result==null||result.Battery==null));
+                    if(result!=null&&result.Battery!=null&&next.Battery==null&&result.DeviceKey==next.DeviceKey){next.Battery=result.Battery;next.BatteryError=null;}
+                    result=next;
+                    if(result.Dpi!=null&&(!includeBattery||result.Battery!=null))break;
+                } catch(Exception e) {
+                    if(result==null)result=new MouseSnapshot {BatteryError=e.Message,DpiError=e.Message};
+                }
+                if(attempt<1)Thread.Sleep(150);
+            }
+            return result;
+        }
+        public TrayContext(bool showPanel=false) : this(showPanel,ReadWithRetry,MouseBattery.SetActiveDpiStage,HeadsetBattery.Read,AudioBrokerClient.Read,true,AudioBrokerClient.Switch,AudioBrokerClient.Mute,AudioBrokerClient.Volume,null,AudioBrokerClient.Execute,null,null,MouseBattery.SetActiveDpiStage,null,true) {
+            updates=new UpdateController(dispatch,UpdateIcon,delegate(string title,string message,bool update){balloonRoute.Set(update?TrayBalloonKind.Update:TrayBalloonKind.LowBattery);tray.ShowBalloonTip(5000,title,message.Length>240?message.Substring(0,240):message,ToolTipIcon.Info);});
+            // Program.Main already holds Local\ATK-A9-Air-Battery-Tray for this lifetime.
+            FeedbackReplies=new FeedbackReplies(FeedbackStore.Current,new FeedbackHttp());
+            feedbackChecks=new FeedbackReplyController(FeedbackReplies,dispatch,delegate(FeedbackBalloon balloon){balloonRoute.Set(TrayBalloonKind.Feedback,balloon.Number);tray.ShowBalloonTip(5000,balloon.Title,balloon.Text,ToolTipIcon.Info);});
+            deviceDebounce.Interval=1200;deviceDebounce.Tick+=delegate {deviceDebounce.Stop();RefreshBattery(false);};
+            deviceEvents=new DeviceEventsWindow(delegate {if(!disposed){ActivityTopologyChanged();deviceDebounce.Stop();deviceDebounce.Start();}},delegate{Style.InvalidateTheme();UpdateIcon();},delegate(bool locked){sessionLocked=locked;refresh.Interval=locked?Math.Max(300000,DeviceSettings.Current.BackgroundSeconds*1000):DeviceSettings.Current.BackgroundSeconds*1000;if(locked){activityTimer.Stop();if(details!=null&&!details.IsDisposed)details.CloseAnimated();}else{deviceDebounce.Stop();deviceDebounce.Start();}},delegate{if(!disposed)trayIcons.RecreateAll();});
+            try{mouseActivity=new MouseActivityListener(HandleMouseActivity,delegate(Action action){if(!disposed)dispatch.BeginInvoke((MethodInvoker)delegate{if(!disposed)action();});});activityListenerState="ready";}catch(Exception){activityListenerState="unavailable";SafeDiagnostic.Transition("mouse_activity","unavailable");}
+            audioDebounce.Interval=200;audioDebounce.Tick+=delegate{audioDebounce.Stop();RequestAudioRead(true);};
+            ThreadPool.QueueUserWorkItem(delegate{try{var listener=AudioControl.Listen(delegate{try{dispatch.BeginInvoke((MethodInvoker)delegate{if(!disposed){audioDebounce.Stop();audioDebounce.Start();}});}catch(InvalidOperationException){}});if(disposed)listener.Dispose();else audioEvents=listener;}catch(Exception){SafeDiagnostic.Transition("audio_notifications","unavailable");}});
+            try {string path=Path.Combine(DeviceSettings.DataDirectory,"low-battery-state.txt");if(File.Exists(path)&&new FileInfo(path).Length<65536){string text=File.ReadAllText(path);lowBattery.Restore("mouse",text.Contains("mouse=1"));lowBattery.Restore("headset",text.Contains("headset=1"));foreach(System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(text,@"(?m)^(device-[a-f0-9]{24})=1\r?$"))lowBattery.Restore(match.Groups[1].Value,true);}}catch(IOException){}catch(UnauthorizedAccessException){}
+            if(persistStatus) dispatch.BeginInvoke((MethodInvoker)delegate{MacroEngine.Start();});
+        }
+        internal TrayContext(bool showPanel,Func<bool,MouseSnapshot> read,Func<int,DpiConfig> select) : this(showPanel,read,select,null,null) {}
+        internal TrayContext(bool showPanel,Func<bool,MouseSnapshot> read,Func<int,DpiConfig> select,Func<HeadsetReading> headsetReader,Func<AudioReading> audioReader,bool diagnostics=false,Func<string,AudioReading> outputWriter=null,Func<bool,AudioReading> muteWriter=null,Func<string,int,AudioReading> volumeWriter=null,Func<bool> leftButtonReader=null,Func<AudioCommand,AudioReading> audioCommandRunner=null,GenericBatteryWorker wirelessReader=null,Func<DateTime> activityTime=null,Func<NativeDpiRequest,DpiConfig> nativeDpiWriter=null,Action<AudioBindings> configurationWriter=null,bool enableDevicePacks=false) {
+            persistStatus=diagnostics;
+            readSnapshot=read;selectStage=select;readHeadset=headsetReader;readAudio=audioReader;writeOutput=outputWriter;writeMute=muteWriter;writeVolume=volumeWriter;
+            writeAudioCommand=audioCommandRunner;
+            writeNativeDpi=nativeDpiWriter;
+            genericWorker=wirelessReader;
+            activityClock=activityTime??new Func<DateTime>(delegate{return DateTime.UtcNow;});
+            saveConfiguration=configurationWriter??DeviceSettings.SaveConfiguration;
+            activityTimer.Tick+=delegate{activityTimer.Stop();DrainActivityRefresh();};
+            readLeftButton=leftButtonReader??new Func<bool>(NativeDisplay.IsLeftButtonPressed);
+            if(diagnostics){if(genericWorker==null){
+                genericWorker=new GenericBatteryWorker();
+                if(enableDevicePacks){
+                devicePacks=new DevicePackManager(Path.Combine(DeviceSettings.DataDirectory,"device-pack"),new UpdateHttp(AppRuntime.Version,15000),genericWorker.ActivatePack,DateTime.UtcNow);
+                genericWorker.UseDevicePacks(devicePacks);devicePackChecks=new DevicePackController(devicePacks);
+                }
+            }try{NativeMousePresent=MouseBattery.Enumerate().Count>0;}catch{NativeMousePresent=false;}}
+            var unused=dispatch.Handle;
+            var menu=new ContextMenuStrip();
+            var detail=new ToolStripMenuItem("设备电量与音频");detail.Click+=delegate {ShowDetails();};menu.Items.Add(detail);
+            var update=new ToolStripMenuItem("\u5237\u65b0");update.Click+=delegate {RefreshBattery();};menu.Items.Add(update);
+            menu.Items.Add(audioSettingsMenu);menu.Opening+=delegate {BuildAudioSettingsMenu();};
+            var peripherals=new ToolStripMenuItem("外设驱动中心…");
+            peripherals.Click+=delegate{PeripheralHubForm.ShowHub(null);};
+            menu.Items.Add(peripherals);
+            var openrgb=new ToolStripMenuItem("ARGB 灯光（OpenRGB）…");
+            openrgb.Click+=delegate {
+                var app=PeripheralCatalog.Find("openrgb");
+                if(!PeripheralCatalog.Open(app))MessageBox.Show("未能打开 OpenRGB，请先安装或从官网下载。","设备电量",MessageBoxButtons.OK,MessageBoxIcon.Information);
+            };
+            menu.Items.Add(openrgb);
+            var settingsItem=new ToolStripMenuItem("设置…");settingsItem.Click+=delegate {ShowSettings();};menu.Items.Add(settingsItem);
+            var startupItem=new ToolStripMenuItem("开机自启"){CheckOnClick=true,Checked=StartupManager.IsEnabled()};
+            startupItem.Click+=delegate {
+                if(!StartupManager.SetEnabled(startupItem.Checked)) {
+                    startupItem.Checked=!startupItem.Checked;
+                    MessageBox.Show("无法修改开机自启，请检查启动文件夹是否可写。","设备电量",MessageBoxButtons.OK,MessageBoxIcon.Warning);
+                }
+            };
+            menu.Items.Add(startupItem);menu.Opening+=delegate {startupItem.Checked=StartupManager.IsEnabled();};
+            var checkUpdates=new ToolStripMenuItem("检查更新…");checkUpdates.Click+=delegate{if(UpdateAvailable)OpenUpdate();else CheckUpdates();};menu.Items.Add(checkUpdates);
+            menu.Opening+=delegate{checkUpdates.Text=UpdateAvailable?"查看新版本 "+updates.Version+"…":"检查更新…";};
+            var myFeedback=new ToolStripMenuItem("我的反馈");myFeedback.Click+=delegate{OpenMyFeedback();};menu.Items.Add(myFeedback);
+            menu.Opening+=delegate{myFeedback.Text=FeedbackReplies.Store.MenuText;};
+            menu.Items.Add(new ToolStripSeparator());
+            var exit=new ToolStripMenuItem("\u9000\u51fa");exit.Click+=delegate {ExitThread();};menu.Items.Add(exit);
+            ConfigureTrayIcon(tray,menu);
+            trayIcons=new TrayIconSet(new NativeTrayIcon(tray,diagnostics),delegate(string id){var extra=new NotifyIcon();ConfigureTrayIcon(extra,menu);return new NativeTrayIcon(extra,diagnostics);});
+            if(diagnostics&&DeviceSettings.Current.RememberReadings)ReadingCache.Load(Path.Combine(DeviceSettings.DataDirectory,"readings-cache.json"),out LastGood,out lastKnownHeadset);
+            if(diagnostics&&DeviceSettings.Current.RememberReadings)foreach(var device in ReadingCache.LoadWireless(Path.Combine(DeviceSettings.DataDirectory,"wireless-cache.json")))wirelessCache[device.Id]=device;
+            UpdateIcon();
+            refresh.Interval=DeviceSettings.Current.BackgroundSeconds*1000;refresh.Tick+=delegate {if(!panelOpen){RequestRead(true,false);RequestHeadsetRead(false);RequestAudioRead(false);RequestWirelessRead(false);}};refresh.Start();
+            expiryTimer.Tick+=delegate{expiryTimer.Stop();UpdateIcon();};
+            operationTimer.Interval=500;operationTimer.Tick+=delegate{if(audioBusy!=0&&(DateTime.UtcNow-audioOperationStarted).TotalSeconds>4){audioActionFailure="音频响应较慢，结果尚未确认";audioFailureAt=DateTime.UtcNow;if(details!=null&&!details.IsDisposed)details.Invalidate();}};
+            liveSync.Interval=2000;liveSync.Tick+=delegate {
+                if(!panelOpen||details==null||details.IsDisposed||!details.Visible){liveSync.Stop();return;}
+                bool batteryDue=Current==null||(DateTime.UtcNow-Current.TimestampUtc).TotalSeconds>=30;
+                RequestRead(batteryDue,false);
+                RequestHeadsetRead(false);RequestAudioRead(false);
+                RequestWirelessRead(false);
+            };
+            tray.BalloonTipClicked+=delegate {balloonRoute.Click(OpenUpdate,delegate{ShowDetails(true);},delegate(long number){OpenMyFeedback(number);});};
+            RefreshBattery(false);
+            if(showPanel)dispatch.BeginInvoke((MethodInvoker)delegate {ShowDetails(true);});
+        }
+        void ConfigureTrayIcon(NotifyIcon notify,ContextMenuStrip menu){
+            notify.ContextMenuStrip=menu;
+            // MouseClick omits the second release of a Windows double-click.
+            notify.MouseDown+=delegate(object sender,MouseEventArgs e){HandleTrayMouseDown(e.Button);};
+            notify.MouseUp+=delegate(object sender,MouseEventArgs e){HandleTrayMouseUp(e.Button);};
+        }
+        void ShowDetails(bool fromLauncher=false) {
+            if(details!=null&&!details.IsDisposed){details.Reveal();return;}
+            details=new Details(this);details.OpenAnimated(fromLauncher);
+        }
+        internal void RequestUpdatedPanel() {
+            if(disposed)return;
+            if(updatedPanelRequest==null)updatedPanelRequest=new UpdatedPanelRequest(delegate{return TrayPanelPlacement.FindIcon(tray,DeviceSettings.Current.LastTrayIconPosition);},TrayPanelPlacement.Fallback,OpenUpdatedPanel);
+            updatedPanelRequest.Start();
+        }
+        internal void OpenUpdatedPanel(TrayPanelAnchor placement) {
+            if(disposed)return;
+            if(details==null||details.IsDisposed)details=new Details(this);
+            details.OpenUpdated(placement);
+            if(!updatedNoticeShown){updatedNoticeShown=true;details.NoticeUpdated();}
+        }
+        internal bool LeftButtonPressed {get{return readLeftButton();}}
+        internal bool OwnsDetails(Details popup){return !disposed&&details==popup;}
+        internal void HandleTrayMouseDown(MouseButtons button) {
+            if(button!=MouseButtons.Left||disposed)return;
+            trayPressPending=true;trayPressTarget=details!=null&&!details.IsDisposed?details:null;
+            trayPressCloses=trayPressTarget!=null&&!trayPressTarget.IsClosing;
+            if(!trayPressCloses&&trayPressTarget!=null)trayPressTarget.CancelDeferredDeactivation();
+        }
+        internal void HandleTrayMouseUp(MouseButtons button) {
+            if(button!=MouseButtons.Left||disposed)return;
+            var target=trayPressPending?trayPressTarget:details;
+            // Up-only tray mirrors should also close a surviving popup, never reverse
+            // a dismissal. With paired notifications the down-time intent wins.
+            bool close=trayPressPending?trayPressCloses:target!=null&&!target.IsDisposed;
+            trayPressPending=false;trayPressCloses=false;trayPressTarget=null;
+            if(close){if(target!=null&&!target.IsDisposed&&OwnsDetails(target))target.CloseAnimated();return;}
+            var point=CursorPosition();var preferences=DeviceSettings.Current;
+            preferences.LastTrayIconPosition=TrayIconPosition.Capture(point,Screen.FromPoint(point).Bounds);
+            try{saveConfiguration(preferences);}catch(Exception){SafeDiagnostic.Transition("tray_position","save_failed");}
+            if(details!=null&&!details.IsDisposed){details.Reveal();return;}
+            details=new Details(this);details.OpenFromTray(point);
+        }
+        internal void ListenForShowRequest(ShowPanelSignal signal,bool updated=false) {
+            signal.Listen(delegate {if(disposed)return;try {dispatch.BeginInvoke((MethodInvoker)delegate {if(disposed)return;if(updated)RequestUpdatedPanel();else ShowDetails(true);});}catch(InvalidOperationException){}});
+        }
+        internal void ListenForExitRequest(ShowPanelSignal signal){signal.Listen(delegate{try{dispatch.BeginInvoke((MethodInvoker)delegate{if(!disposed)ExitThread();});}catch(InvalidOperationException){}});}
+        public void ShowSettings() {
+            if(details==null||details.IsDisposed){details=new Details(this);details.OpenAnimated(true);}else details.Reveal();
+            details.ShowPreferences();
+        }
+        public void RefreshAudioDevices(){RequestAudioRead(true);}
+        public void SetAudioScope(string deviceId){
+            deviceId=String.IsNullOrWhiteSpace(deviceId)?null:deviceId;
+            if(disposed){audioScopeDeviceId=deviceId;return;}
+            if(String.Equals(audioScopeDeviceId,deviceId,StringComparison.Ordinal))return;
+            if(deviceId!=null)DeviceSettings.ForAudioDevice(deviceId);
+            audioScopeDeviceId=deviceId;ConfigurationChanged();
+        }
+        public void ConfigurationChanged(bool refreshAudio=true){
+            if(updates!=null)updates.ConfigurationChanged();
+            if(feedbackChecks!=null)feedbackChecks.ConfigurationChanged();
+            refresh.Interval=sessionLocked?Math.Max(300000,DeviceSettings.Current.BackgroundSeconds*1000):DeviceSettings.Current.BackgroundSeconds*1000;
+            if(refreshAudio){
+                Interlocked.Increment(ref audioGeneration);ClearPendingAudioCommands();audioNeedsReconcile=true;
+                audioTargetInFlight=null;microphoneTargetInFlight=null;volumeTargetInFlight=null;audioActionFailure=null;
+                if(audioEvents!=null)audioEvents.SetMicrophoneTarget(null);RequestAudioRead(true);
+            }
+            UpdateIcon();
+        }
+        internal void SavePreferences(AudioBindings preferences){saveConfiguration(preferences);}
+        internal void SetVolumeCollapsed(bool collapsed) {
+            var pref=DeviceSettings.Current;if(pref.VolumeCollapsed==collapsed)return;pref.VolumeCollapsed=collapsed;
+            try{saveConfiguration(pref);ConfigurationChanged(false);}
+            catch(Exception error){if(details!=null&&!details.IsDisposed)details.Notice("未保存："+error.Message);}
+        }
+        public PanelFeedback GetFeedback() {
+            var now=DateTime.UtcNow;
+            return new PanelFeedback {PendingStage=pendingStage>=0?pendingStage:stageInFlight,
+                PendingOutput=pendingAudioOutput??audioTargetInFlight,MicrophonePending=pendingMicrophoneMute.HasValue||microphoneTargetInFlight.HasValue,
+                DpiFailure=(now-dpiFailureAt).TotalSeconds<10?dpiActionFailure:null,
+                AudioFailure=audioNeedsReconcile?"音频状态未确认，控制暂时停用":(now-audioFailureAt).TotalSeconds<10?audioActionFailure:null,
+                AudioBlocked=audioNeedsReconcile,
+                ShowPendingHints=(now-actionRequestedAt).TotalMilliseconds>=280,
+                ManualRefreshing=manualRefresh&&(busy!=0||headsetBusy!=0||audioBusy!=0||pendingRead||genericBusy!=0)};
+        }
+        public void PanelOpened() {
+            panelOpen=true;liveSync.Start();RefreshBattery(false);
+        }
+        public void PanelClosed() {
+            if(disposed)return;panelOpen=false;liveSync.Stop();SaveStatus();
+        }
+        void UpdateIcon() {
+            if(busy==0&&headsetBusy==0&&audioBusy==0&&genericBusy==0&&!pendingRead)manualRefresh=false;
+            AudioBindings preferences;try{preferences=DeviceSettings.Current;}catch{preferences=new AudioBindings();}
+            DateTime now=DateTime.UtcNow;var mouse=UiState.Mouse(Current,LastGood,now);var headset=UiState.Headset(Headset,now);
+            var presentation=UiState.Tray(preferences.TraySource,mouse,headset);var shown=presentation.Battery;
+            if(UseWirelessLayout||preferences.TrayGroups.Count>0||preferences.TraySource=="active"||!String.IsNullOrEmpty(preferences.TrayDeviceId)){presentation=WirelessTray(preferences.TraySource);shown=presentation.Battery;}
+            bool dark=Style.Dark;int size=SystemInformation.SmallIconSize.Width;
+            Color background=preferences.TrayIconStyle=="number"?TrayGlyph.NumberFill(shown.Percent,shown.Percent.HasValue&&!shown.Fresh):TrayGlyph.LevelColor(shown.Percent,dark);
+            UpdateDotColor=UpdateBadge.ColorFor(ThemePalette.Current(dark).Accent,background,Style.TaskbarDark);
+            presentation.UpdateColor=UpdateDotColor;presentation.UpdateBadge=updates!=null&&updates.BadgeVisible;
+            presentation.Tooltip=UpdateBadge.Tooltip(presentation.Tooltip,updates==null?null:updates.Version);
+            if(trayIcons.First.Update(presentation,preferences.TrayIconStyle,dark,size))iconUpdates++;
+            trayIcons.Sync(preferences.TrayGroups);
+            foreach(string id in new List<string>(groupDeviceKeys.Keys))if(TrayConfiguration.Find(preferences,id)==null)groupDeviceKeys.Remove(id);
+            if(preferences.TrayGroups.Count>0){
+                var candidates=TrayCandidates(true);
+                foreach(var group in preferences.TrayGroups){
+                    var members=candidates.FindAll(delegate(WirelessCard card){return group.Members.Contains(card.Id)&&(card.Device==null||card.Device.Online&&card.Device.ConnectionState!="disconnected");});
+                    string previous;groupDeviceKeys.TryGetValue(group.Id,out previous);
+                    var selected=TraySelection.Select(members,group.Source,group.DeviceId,activePhysicalId,activeNative,previous,true);
+                    groupDeviceKeys[group.Id]=selected==null?null:selected.Id;
+                    trayIcons.For(group.Id).Update(TraySelection.Present(members,selected,group.Name),preferences.TrayIconStyle,dark,size);
+                }
+            }
+            if(details!=null&&!details.IsDisposed)details.SyncDevices();
+            if(persistStatus&&preferences.LowBatteryNotifications)EvaluateLowBattery(mouse,headset);
+            ScheduleExpiry();
+            SaveStatus();
+        }
+        void ScheduleExpiry(){
+            expiryTimer.Stop();var now=DateTime.UtcNow;DateTime earliest=DateTime.MaxValue;
+            Action<DateTime> add=delegate(DateTime time){if(time==DateTime.MinValue||time>now.AddSeconds(5))return;var expiry=time.AddSeconds(90.1);if(expiry>now&&expiry<earliest)earliest=expiry;};
+            if(Current!=null)add(Current.TimestampUtc);if(Headset!=null){add(Headset.BatteryTimestampUtc);add(Headset.ChargingTimestampUtc);}foreach(var device in WirelessDevices){if(device.Fresh)add(device.ConfirmedTime);if(device.Dpi!=null&&device.Dpi.Supported)add(device.Dpi.CheckedTime);}
+            if(earliest!=DateTime.MaxValue){expiryTimer.Interval=Math.Max(250,Math.Min(91000,(int)(earliest-now).TotalMilliseconds));expiryTimer.Start();}
+        }
+        TrayView WirelessTray(string source) {
+            var pref=DeviceSettings.Current;var available=TrayCandidates(true);
+            available.RemoveAll(delegate(WirelessCard card){return TrayConfiguration.Owner(pref,card.Id)!=TrayConfiguration.FirstId||card.Hidden&&card.Id!=pref.TrayDeviceId;});
+            var selected=TraySelection.Select(available,source,pref.TrayDeviceId,activePhysicalId,activeNative,trayDeviceKey);
+            trayDeviceKey=selected==null?null:selected.Id;
+            return TraySelection.Present(available,selected,pref.TrayGroups.Count>0?TrayConfiguration.FirstName:null);
+        }
+        List<WirelessCard> TrayCandidates(bool includeHidden){return WirelessLayout.Build(this,0,100000,includeHidden).All.FindAll(delegate(WirelessCard card){return card.Id!="empty"&&!card.AudioOnly&&card.Battery!=null&&(card.Device!=null||card.NativeMouse||card.NativeHeadset);});}
+        void EvaluateLowBattery(BatteryView mouse,BatteryView headset) {
+            bool oldMouse=lowBattery.IsLatched("mouse"),oldHeadset=lowBattery.IsLatched("headset");
+            bool allowed=NativeDisplay.MayNotify();var messages=new List<string>();
+            int threshold=DeviceSettings.Current.WarningThreshold;
+            if(lowBattery.Observe("mouse",mouse,allowed,threshold))messages.Add("鼠标剩余 "+mouse.Percent+"%");
+            if(lowBattery.Observe("headset",headset,allowed,threshold))messages.Add("耳机剩余 "+headset.Percent+"%");
+            bool changed=false;
+            foreach(var device in WirelessDevices){bool before=lowBattery.IsLatched(device.Id);var view=WirelessLayout.View(device);if(lowBattery.Observe(device.Id,view,allowed,threshold)){string name;var pref=DeviceSettings.Current;if(!pref.DeviceAliases.TryGetValue(device.Id,out name))name=device.Name;messages.Add(name+"剩余 "+(device.Approximate?"约":"")+device.Percent+"%");}changed|=before!=lowBattery.IsLatched(device.Id);}
+            if(oldMouse!=lowBattery.IsLatched("mouse")||oldHeadset!=lowBattery.IsLatched("headset")||changed)try {
+                Directory.CreateDirectory(DeviceSettings.DataDirectory);
+                var saved=new StringBuilder("mouse="+(lowBattery.IsLatched("mouse")?1:0)+"\nheadset="+(lowBattery.IsLatched("headset")?1:0));
+                foreach(var device in WirelessDevices)if(lowBattery.IsLatched(device.Id))saved.Append('\n').Append(device.Id).Append("=1");
+                fileWriter.Enqueue(Path.Combine(DeviceSettings.DataDirectory,"low-battery-state.txt"),saved.ToString());
+            }catch(IOException){}catch(UnauthorizedAccessException){}
+            if(messages.Count>0){string text=String.Join(" · ",messages.ToArray());if(text.Length>240)text=text.Substring(0,237)+"…";balloonRoute.Set(TrayBalloonKind.LowBattery);tray.ShowBalloonTip(5000,"外设电量较低",text,ToolTipIcon.Warning);}
+        }
+        void SaveStatus() {
+            if(!persistStatus)return;
+            try {
+                if(!clearingHistory&&DeviceSettings.Current.RememberReadings)fileWriter.Enqueue(Path.Combine(DeviceSettings.DataDirectory,"readings-cache.json"),ReadingCache.EncodeNative(Current??LastGood,Headset??lastKnownHeadset));
+                fileWriter.Enqueue(Path.Combine(DeviceSettings.DataDirectory,"status.json"),BuildStatusJson());
+            } catch(IOException) {}catch(UnauthorizedAccessException){}
+        }
+        internal string BuildStatusJson() {
+                string path=Path.Combine(DeviceSettings.DataDirectory,"status.json");
+                var persistence=fileWriter.GetHealth(path);
+                string safe=Escape(ErrorMessage);
+                var stages=new StringBuilder("[");
+                if(Dpi!=null&&Dpi.Stages!=null)for(int i=0;i<Dpi.Stages.Count;i++) {
+                    if(i>0)stages.Append(',');stages.Append("{\"x\":").Append(Dpi.Stages[i].XDpi).Append(",\"y\":").Append(Dpi.Stages[i].YDpi).Append('}');
+                }
+                stages.Append(']');
+                string json="{\"version\":\""+Escape(AppRuntime.Version)+"\",\"instanceId\":\""+instanceId+"\",\"processId\":"+processId+",\"processStartedAtUtc\":\""+processStartedAtUtc.ToString("o")+"\",\"snapshotGeneratedAtUtc\":\""+DateTime.UtcNow.ToString("o")+"\",\"page\":\""+(details==null||details.IsDisposed?"closed":details.CurrentPage)+"\",\"liveVerified\":"+(Current!=null&&UiState.Recent(Current.TimestampUtc,DateTime.UtcNow,90)?"true":"false")+
+                    ",\"percent\":"+(Current!=null?Current.Percent.ToString():"null")+
+                    ",\"charging\":"+(Current!=null?Current.Charging.ToString().ToLower():"null")+
+                    ",\"dpiLiveVerified\":"+NativeDpiVerified.ToString().ToLower()+",\"nativeDpiReconcilePending\":"+nativeNeedsReconcile.ToString().ToLower()+",\"discardedNativeResults\":"+discardedNativeResults+
+                    ",\"dpi\":"+(Dpi!=null&&Dpi.Stages!=null&&Dpi.ActiveStage>=0&&Dpi.ActiveStage<Dpi.Stages.Count?Dpi.Stages[Dpi.ActiveStage].XDpi.ToString():"null")+
+                    ",\"activeStage\":"+(Dpi!=null?Dpi.ActiveStage.ToString():"null")+
+                    ",\"stages\":"+stages+
+                    ",\"panelOpen\":"+panelOpen.ToString().ToLower()+",\"syncIntervalMs\":"+(panelOpen?"2000":refresh.Interval.ToString())+
+                    ",\"busy\":"+(busy!=0?"true":"false")+",\"pendingStage\":"+pendingStage+
+                    ",\"completedReads\":"+completedReads+",\"completedSwitches\":"+completedSwitches+
+                    ",\"iconUpdates\":"+iconUpdates+
+                    ",\"batteryCheckedAtUtc\":"+(Current!=null?"\""+Current.TimestampUtc.ToString("o")+"\"":"null")+
+                    ",\"dpiCheckedAtUtc\":"+(Dpi!=null?"\""+Dpi.TimestampUtc.ToString("o")+"\"":"null")+
+                    ",\"checkedAtUtc\":\""+lastSyncUtc.ToString("o")+"\",\"detail\":\""+safe+"\",\"dpiDetail\":\""+Escape(DpiError)+"\""+
+                    ",\"headset\":{\"receiverPresent\":"+(Headset!=null&&Headset.ReceiverPresent?"true":"false")+
+                    ",\"connectionVerified\":"+(Headset!=null&&Headset.ConnectionVerified?"true":"false")+
+                    ",\"connected\":"+(Headset!=null&&Headset.ConnectionVerified?Headset.Connected.ToString().ToLower():"null")+
+                    ",\"percent\":"+(Headset!=null&&Headset.Percent.HasValue?Headset.Percent.Value.ToString():"null")+
+                    ",\"detail\":\""+Escape(Headset==null?"Not yet read":Headset.Detail)+"\"}"+
+                    ",\"audio\":{\"activeOutput\":\""+Escape(Audio==null?"unknown":Audio.ActiveOutput)+"\",\"headsetAvailable\":"+(Audio!=null&&Audio.HeadsetAvailable?"true":"false")+
+                    ",\"speakerAvailable\":"+(Audio!=null&&Audio.SpeakerAvailable?"true":"false")+
+                    ",\"volumePercent\":"+(Audio!=null&&Audio.OutputVolumePercent.HasValue?Audio.OutputVolumePercent.Value.ToString():"null")+
+                    ",\"microphoneMuted\":"+(Audio!=null&&Audio.MicrophoneMuted.HasValue?Audio.MicrophoneMuted.Value.ToString().ToLower():"null")+
+                    ",\"error\":\""+Escape(Audio==null?"":SafeDiagnostic.Clean(Audio.Error))+"\"},\"universalReady\":"+GenericReady.ToString().ToLower()+",\"universalDeviceCount\":"+WirelessDevices.Length+",\"universalError\":\""+Escape(GenericError)+"\",\"readerHealth\":\""+Escape(GenericHealthSummary)+"\",\"readerFailures\":"+GenericFailureCount+",\"readerIdle\":"+GenericIdleCount+",\"audioReconcilePending\":"+audioNeedsReconcile.ToString().ToLower()+
+                    ",\"genericDpi\":{\"busy\":"+(wirelessDpiInFlight!=null).ToString().ToLower()+",\"pendingCount\":"+pendingWirelessDpi.Count+",\"reconcilePending\":"+wirelessDpiNeedsReconcile.ToString().ToLower()+
+                    ",\"lastRequestedDpi\":"+(lastWirelessDpiResult==null?"null":lastWirelessDpiResult.RequestedDpi.ToString())+",\"lastConfirmedDpi\":"+(lastWirelessDpiResult!=null&&lastWirelessDpiResult.ConfirmedDpi.HasValue?lastWirelessDpiResult.ConfirmedDpi.Value.ToString():"null")+
+                    ",\"lastSuccess\":"+(lastWirelessDpiResult==null?"null":lastWirelessDpiResult.Success.ToString().ToLower())+",\"outcomeUnknown\":"+(lastWirelessDpiResult==null?"null":lastWirelessDpiResult.OutcomeUnknown.ToString().ToLower())+
+                    ",\"error\":\""+Escape(lastWirelessDpiResult==null?"":SafeDiagnostic.Clean(lastWirelessDpiResult.Error))+"\",\"checkedAtUtc\":\""+Escape(lastWirelessDpiResult==null?"":lastWirelessDpiResult.CheckedAtUtc)+"\"},\"activityRefresh\":{\"listener\":\""+activityListenerState+"\",\"registered\":"+(mouseActivity!=null&&mouseActivity.Registered).ToString().ToLower()+",\"rawInputMessages\":"+(mouseActivity==null?0:mouseActivity.RawInputMessages)+",\"mousePackets\":"+(mouseActivity==null?0:mouseActivity.MousePackets)+",\"headerReadFailures\":"+(mouseActivity==null?0:mouseActivity.HeaderReadFailures)+",\"resolvedSources\":"+(mouseActivity==null?0:mouseActivity.ResolvedSourceCount)+",\"unresolvedSources\":"+(mouseActivity==null?0:mouseActivity.UnresolvedSourceCount)+",\"events\":"+activityRefresh.Events+",\"freshSkipped\":"+activityRefresh.FreshSkipped+",\"coalesced\":"+activityRefresh.Coalesced+",\"cooldownSkipped\":"+activityRefresh.CooldownSkipped+",\"unsupportedSkipped\":"+activityRefresh.UnsupportedSkipped+",\"reads\":"+activityRefresh.Reads+",\"retries\":"+activityRefresh.Retries+",\"failures\":"+activityRefresh.Failures+",\"deferred\":"+activityRefresh.Deferred+",\"pendingSources\":"+activityRefresh.Pending+"}}";
+                json=json.Substring(0,json.Length-1)+",\"persistence\":{\"lastSuccessfulStatusWriteUtc\":"+JsonTime(persistence.LastSuccessUtc)+",\"lastFailureUtc\":"+JsonTime(persistence.LastFailureUtc)+",\"failureCount\":"+persistence.FailureCount+",\"errorCode\":\""+Escape(persistence.ErrorCode)+"\",\"inFlight\":"+persistence.InFlight.ToString().ToLower()+"}}";
+                return json;
+        }
+        static string Escape(string value) {return (value??"").Replace("\\","\\\\").Replace("\"","\\\"").Replace("\r"," ").Replace("\n"," ");}
+        static string JsonTime(DateTime value){return value==DateTime.MinValue?"null":"\""+value.ToString("o")+"\"";}
+        public void RefreshBattery(bool manual=true) {
+            manualRefresh|=manual;
+            RequestRead(true,true);
+            RequestHeadsetRead(true);RequestAudioRead(true);
+            RequestWirelessRead(true);
+        }
+        public void RefreshDevice(string device) {
+            manualRefresh=true;
+            if(device=="mouse")RequestRead(true,true);
+            else if(device=="headset")RequestHeadsetRead(true);
+            else RefreshBattery();
+            UpdateIcon();
+        }
+        public void RefreshWireless(string deviceId=null){manualRefresh=true;RequestWirelessRead(true,deviceId);UpdateIcon();}
+        internal void HandleMouseActivity(MouseActivitySource source){
+            if(disposed||sessionLocked||source==null)return;
+            if(source.IsNativeAtk)NativeMousePresent=true;
+            DateTime now=activityClock();
+            // Independent from refresh scheduling: a fresh reading makes Record return false.
+            if((activePhysicalId!=source.PhysicalId||activeNative!=source.IsNativeAtk)&&(activeSwitchedAt==DateTime.MinValue||(now-activeSwitchedAt).TotalSeconds>=3)) {
+                activePhysicalId=source.PhysicalId;activeNative=source.IsNativeAtk;activeSwitchedAt=now;
+                var pref=DeviceSettings.Current;
+                if(pref.TraySource=="active"||pref.TrayGroups.Exists(delegate(TrayGroup group){return group.Source=="active";}))UpdateIcon();
+            }
+            if(activityRefresh.Record(source.PhysicalId,source.IsNativeAtk,FreshActivitySource(source.PhysicalId,source.IsNativeAtk),activityClock()))DrainActivityRefresh();
+        }
+        internal void ActivityTopologyChanged(){
+            if(disposed)return;Interlocked.Increment(ref nativeEpoch);pendingNativeDpi=null;pendingStage=-1;nativeNeedsReconcile=true;
+            DpiError="设备连接已变化，等待重新确认";
+            if(mouseActivity!=null)mouseActivity.InvalidateTopology();activityRefresh.TopologyChanged();nativeActivityInFlight=null;genericActivityInFlight=null;activityTimer.Stop();UpdateIcon();
+        }
+        bool FreshActivitySource(string physicalId,bool native){
+            DateTime now=activityClock();
+            if(native)return Current!=null&&String.IsNullOrEmpty(ErrorMessage)&&UiState.Recent(Current.TimestampUtc,now,90);
+            bool found=false;foreach(var device in WirelessDevices)if(device.PhysicalId==physicalId&&device.Kind=="mouse"){
+                found=true;if(!device.Online||device.ConnectionState!="connected"||!device.Fresh||!device.Percent.HasValue||device.SourceQuality=="cached"||device.SourceQuality=="system_property"||!UiState.Recent(device.ConfirmedTime,now,90))return false;
+            }
+            return found;
+        }
+        bool ActivityCanStart(bool native){return !disposed&&!sessionLocked&&!clearingHistory&&(native?busy==0&&pendingStage<0&&!pendingRead:genericWorker!=null&&genericWorker.Available&&genericBusy==0&&!genericQueued&&pendingWirelessDpi.Count==0);}
+        void DrainActivityRefresh(){
+            if(disposed)return;activityTimer.Stop();
+            ActivityRefreshRequest request;while((request=activityRefresh.Take(activityClock(),FreshActivitySource,ActivityCanStart))!=null){
+                if(request.IsNativeAtk){NativeMousePresent=true;nativeActivityInFlight=request;RequestRead(true,true);}
+                else{genericActivityInFlight=request;RequestWirelessRead(true,null,request.PhysicalId);}
+            }
+            var due=activityRefresh.NextDue(ActivityCanStart);if(due.HasValue){activityTimer.Interval=Math.Max(50,Math.Min(30000,(int)Math.Max(0,(due.Value-activityClock()).TotalMilliseconds)));activityTimer.Start();}
+        }
+        void CompleteNativeActivity(){
+            var request=nativeActivityInFlight;if(request==null)return;nativeActivityInFlight=null;activityRefresh.Complete(request,FreshActivitySource(request.PhysicalId,true),false,activityClock());
+        }
+        static bool HealthyPhysicalWithoutMouse(WirelessSnapshot snapshot,string physicalId){
+            if(snapshot==null||!String.IsNullOrEmpty(snapshot.Error))return false;
+            foreach(var device in snapshot.Devices??new WirelessDevice[0])if(device.PhysicalId==physicalId&&device.Kind=="mouse")return false;
+            // A reader can have a mouse even when its card was suppressed.
+            // Do not disable activity recovery based on presentation alone.
+            bool hiddenMouse=Array.Exists(snapshot.Suppressed??new SuppressedDevice[0],delegate(SuppressedDevice d){return d!=null&&d.Kind=="mouse";});
+            bool matched=false;foreach(var health in snapshot.Health??new ReaderHealth[0])if(health.PhysicalId==physicalId){matched=true;if(hiddenMouse&&health.DeviceCount>0||health.State!="ok"&&health.State!="unsupported"&&health.State!="no_devices")return false;}
+            return matched;
+        }
+        void ApplyWirelessRead(WirelessSnapshot snapshot,bool complete,bool physical){bool previous=applyingPhysicalSnapshot;applyingPhysicalSnapshot=physical;try{ApplyWireless(snapshot,complete);}finally{applyingPhysicalSnapshot=previous;}}
+        WirelessDevice FindWirelessDpiDevice(string id){return Array.Find(WirelessDevices,delegate(WirelessDevice device){return device!=null&&device.Id==id;});}
+        bool HasPendingWirelessDpi(string id){if(wirelessDpiInFlight!=null&&wirelessDpiInFlight.DeviceId==id)return true;foreach(var request in pendingWirelessDpi)if(request.DeviceId==id)return true;return false;}
+        public bool CanSetWirelessDpi(string deviceId,string targetToken){
+            var device=FindWirelessDpiDevice(deviceId);
+            return !disposed&&!clearingHistory&&!wirelessDpiNeedsReconcile&&!HasPendingWirelessDpi(deviceId)&&device!=null&&device.Dpi!=null&&device.Dpi.CanWrite(device,targetToken);
+        }
+        public int? DesiredWirelessDpi(string deviceId,string targetToken){
+            foreach(var request in pendingWirelessDpi)if(request.DeviceId==deviceId&&request.TargetToken==targetToken)return request.Dpi;
+            return wirelessDpiInFlight!=null&&wirelessDpiInFlight.DeviceId==deviceId&&wirelessDpiInFlight.TargetToken==targetToken?(int?)wirelessDpiInFlight.Dpi:null;
+        }
+        public string WirelessDpiFailure(string deviceId,string targetToken){
+            DpiFailureState failure;if(wirelessDpiFailures.TryGetValue(deviceId??"",out failure)&&failure.Token==targetToken&&(DateTime.UtcNow-failure.At).TotalSeconds<15)return DpiFailureText(failure.Error);
+            if(wirelessDpiNeedsReconcile)return "DPI状态待确认，正在重新读取。";
+            var device=FindWirelessDpiDevice(deviceId);return device==null||device.Dpi==null?null:DpiFailureText(device.Dpi.Error);
+        }
+        static string DpiFailureText(string error){
+            if(String.IsNullOrEmpty(error))return null;
+            switch(error){
+                case "current_changed":return "DPI已被其他程序更改，请重新同步。";
+                case "invalid_target":case "target_changed":case "stale_target":case "stale_snapshot":return "设备或接收器已改变，请重新同步。";
+                case "unsupported":case "unsupported_dpi":case "invalid_dpi":return "此设备不支持该DPI值。";
+                case "offline":case "device_offline":case "device_missing":return "鼠标未连接或正在休眠。";
+                case "timeout":case "write_timeout":case "outcome_unknown":return "DPI结果未确认，请先同步；未自动重试。";
+                case "read_failed":case "write_failed":case "verify_failed":case "dpi_read_failed":return "DPI读写未能确认，请先同步。";
+                default:return System.Text.RegularExpressions.Regex.IsMatch(error,@"^[a-z][a-z0-9_:-]*$")?"DPI控制暂不可用，请重新同步。":error;
+            }
+        }
+        internal string WirelessDpiPresentationKey {get{
+            var key=new StringBuilder(wirelessDpiNeedsReconcile?"blocked":"ready");
+            foreach(var device in WirelessDevices)if(device.Dpi!=null)key.Append('|').Append(device.Id).Append(':').Append(DesiredWirelessDpi(device.Id,device.Dpi.TargetToken)).Append(':').Append(WirelessDpiFailure(device.Id,device.Dpi.TargetToken)).Append(':').Append(CanSetWirelessDpi(device.Id,device.Dpi.TargetToken));
+            return key.ToString();
+        }}
+        public void SelectWirelessDpi(string deviceId,string targetToken,int dpi){
+            if(genericWorker==null||!genericWorker.Available||!CanSetWirelessDpi(deviceId,targetToken))return;
+            var device=FindWirelessDpiDevice(deviceId);if(!WirelessDpi.ValidValue(dpi)||!device.Dpi.HasStage(dpi)||device.Dpi.Current==dpi)return;
+            pendingWirelessDpi.Enqueue(new WirelessDpiRequest(device.Id,targetToken,dpi,device.Dpi.Current.Value,device.Provider,device.Kind,wirelessDpiEpoch));
+            wirelessDpiFailures.Remove(deviceId);RunPendingWirelessDpi();UpdateIcon();
+        }
+        void FailWirelessDpi(WirelessDpiRequest request,string error){wirelessDpiFailures[request.DeviceId]=new DpiFailureState {Token=request.TargetToken,Error=error,At=DateTime.UtcNow};}
+        void BlockWirelessDpi(){
+            Interlocked.Increment(ref wirelessDpiEpoch);wirelessDpiNeedsReconcile=true;pendingWirelessDpi.Clear();
+            foreach(var device in WirelessDevices)GenericBatteryWorker.DisableDpi(device.Dpi);
+        }
+        void ContinueWirelessQueue(){
+            if(disposed||clearingHistory||genericBusy!=0)return;
+            if(genericQueued){string target=genericQueuedTarget;genericQueued=false;genericQueuedTarget=null;RequestWirelessRead(true,target);}
+            else{RunPendingWirelessDpi();if(genericBusy==0)DrainActivityRefresh();}
+        }
+        void RunPendingWirelessDpi(){
+            if(disposed||clearingHistory||genericBusy!=0||wirelessDpiNeedsReconcile||genericWorker==null)return;
+            while(pendingWirelessDpi.Count>0){
+                var request=pendingWirelessDpi.Dequeue();var device=FindWirelessDpiDevice(request.DeviceId);
+                if(request.Epoch!=wirelessDpiEpoch||device==null||device.Provider!=request.Provider||device.Kind!=request.Kind||device.Dpi==null||!device.Dpi.CanWrite(device,request.TargetToken)||device.Dpi.Current!=request.ExpectedDpi||!device.Dpi.HasStage(request.Dpi)){
+                    FailWirelessDpi(request,"设备或DPI状态已改变，请重新同步后选择。");continue;
+                }
+                wirelessDpiInFlight=request;genericBusy=1;genericTarget=request.DeviceId;
+                ThreadPool.QueueUserWorkItem(delegate{
+                    WirelessSnapshot snapshot;
+                    try {snapshot=Thread.VolatileRead(ref wirelessDpiEpoch)==request.Epoch?genericWorker.SetDpi(request.DeviceId,request.TargetToken,request.Dpi,request.ExpectedDpi):new WirelessSnapshot {Error="读取组件已重置，DPI操作已取消。"};}
+                    catch(Exception){snapshot=new WirelessSnapshot {Error="DPI控制结果未确认。",DpiResult=new WirelessDpiResult {DeviceId=request.DeviceId,TargetToken=request.TargetToken,RequestedDpi=request.Dpi,OutcomeUnknown=true,Error="DPI控制结果未确认。"}};}
+                    if(disposed)return;
+                    try{dispatch.BeginInvoke((MethodInvoker)delegate{
+                        if(disposed)return;genericBusy=0;genericTarget=null;wirelessDpiInFlight=null;genericChecked=DateTime.UtcNow;
+                        if(request.Epoch==wirelessDpiEpoch){
+                            lastWirelessDpiResult=snapshot.DpiResult;
+                            ApplyWireless(snapshot,true);
+                            if(snapshot.DpiResult==null||!snapshot.DpiResult.Success||snapshot.DpiResult.OutcomeUnknown||!String.IsNullOrEmpty(snapshot.Error)){
+                                string error=snapshot.DpiResult==null?snapshot.Error:snapshot.DpiResult.Error;FailWirelessDpi(request,String.IsNullOrEmpty(error)?"DPI操作未确认，请先同步。":error);BlockWirelessDpi();genericQueued=true;genericQueuedTarget=null;
+                            }else wirelessDpiFailures.Remove(request.DeviceId);
+                        }else{BlockWirelessDpi();genericQueued=true;genericQueuedTarget=null;}
+                        UpdateIcon();ContinueWirelessQueue();
+                    });}catch(InvalidOperationException){}
+                });
+                return;
+            }
+        }
+        void RequestWirelessRead(bool force,string deviceId=null,string physicalId=null) {
+            if(disposed||genericWorker==null)return;
+            if(clearingHistory){genericQueued=true;genericQueuedTarget=null;return;}
+            if(!genericWorker.Available){GenericError="请使用完整发行包以启用通用设备识别。";return;}
+            if(genericBusy!=0){if(force){genericQueuedTarget=genericQueued&&genericQueuedTarget!=deviceId?null:deviceId;genericQueued=true;}return;}
+            if(!force&&(DateTime.UtcNow-genericChecked).TotalSeconds<(panelOpen?8:DeviceSettings.Current.BackgroundSeconds))return;
+            genericBusy=1;genericTarget=deviceId;genericPhysicalTarget=physicalId;int epoch=historyGeneration;bool parkEmptyReaders=!panelOpen;var activity=genericActivityInFlight;
+            ThreadPool.QueueUserWorkItem(delegate {
+                var snapshot=genericWorker.Poll(force,deviceId,delegate(WirelessSnapshot partial){if(disposed)return;try{dispatch.BeginInvoke((MethodInvoker)delegate{if(!disposed&&epoch==historyGeneration)ApplyWirelessRead(partial,false,physicalId!=null);});}catch(InvalidOperationException){}},parkEmptyReaders,physicalId);if(disposed)return;
+                try{dispatch.BeginInvoke((MethodInvoker)delegate {
+                    if(disposed)return;genericBusy=0;genericTarget=null;genericPhysicalTarget=null;genericChecked=DateTime.UtcNow;
+                    if(epoch==historyGeneration)ApplyWirelessRead(snapshot,true,physicalId!=null);
+                    if(activity!=null){genericActivityInFlight=null;activityRefresh.Complete(activity,FreshActivitySource(activity.PhysicalId,false),epoch==historyGeneration&&HealthyPhysicalWithoutMouse(snapshot,activity.PhysicalId),activityClock());}
+                    UpdateIcon();ContinueWirelessQueue();
+                });}catch(InvalidOperationException){}
+            });
+        }
+        void ApplyWireless(WirelessSnapshot snapshot,bool complete){
+            if(clearingHistory)return;
+            if(String.IsNullOrEmpty(snapshot.Error)){
+                if(snapshot.Generation>0&&snapshot.Generation!=wirelessDpiGeneration){wirelessDpiGeneration=snapshot.Generation;Interlocked.Increment(ref wirelessDpiEpoch);pendingWirelessDpi.Clear();wirelessDpiFailures.Clear();}
+                if(complete&&snapshot.DpiResult==null)wirelessDpiNeedsReconcile=false;
+                GenericReady=true;GenericError=null;WirelessDevices=snapshot.Devices??new WirelessDevice[0];GenericHealth=snapshot.Health??new ReaderHealth[0];GenericFailureCount=0;GenericIdleCount=0;
+                if(snapshot.Unadapted!=null)unadaptedDevices=snapshot.Unadapted;
+                if(snapshot.Suppressed!=null)suppressedDevices=snapshot.Suppressed;
+                foreach(var device in WirelessDevices)if(device.Kind=="mouse")activityRefresh.ObserveMouse(device.PhysicalId);
+                foreach(var health in GenericHealth)if(health.State=="unavailable"&&health.Reason=="no_measurement")GenericIdleCount++;else if(health.State=="error"||health.State=="timeout"||health.State=="unavailable"||health.State=="backoff")GenericFailureCount++;
+                GenericFailureCount=Math.Max(GenericFailureCount,(snapshot.Errors??new string[0]).Length);GenericHealthSummary=GenericFailureCount>0?"部分读取暂不可用（"+GenericFailureCount+"项）":null;
+                GenericIdleSummary=GenericIdleCount>0&&GenericFailureCount==0?GenericIdleCount+" 台设备休眠中，动一下即可刷新":null;
+                var pref=DeviceSettings.Current;
+                foreach(var device in WirelessDevices){WirelessDevice cached;
+                    // A legacy PID-only key cannot prove which physical device
+                    // produced a historical reading, even if only one is here now.
+                    if(pref.RememberReadings&&!device.Percent.HasValue&&wirelessCache.TryGetValue(device.Id,out cached)&&device.SameCacheIdentity(cached)&&(DateTime.UtcNow-cached.ConfirmedTime).TotalDays<=7){device.Percent=cached.Percent;device.ConfirmedAtUtc=cached.ConfirmedAtUtc;device.Fresh=false;device.Approximate=cached.Approximate;device.Unconfirmed=cached.Unconfirmed;device.Charging=null;device.SourceQuality="cached";}
+                    if(device.Percent.HasValue)wirelessCache[device.Id]=device.BatteryCacheCopy();
+                }
+                foreach(string key in new List<string>(wirelessCache.Keys))if((DateTime.UtcNow-wirelessCache[key].ConfirmedTime).TotalDays>7)wirelessCache.Remove(key);
+                if(complete&&!clearingHistory&&pref.RememberReadings)fileWriter.Enqueue(Path.Combine(DeviceSettings.DataDirectory,"wireless-cache.json"),ReadingCache.EncodeWireless(wirelessCache.Values));
+                if(!applyingPhysicalSnapshot){bool previous=NativeMousePresent;if(snapshot.NativeMousePresent.HasValue)NativeMousePresent=snapshot.NativeMousePresent.Value;if(NativeMousePresent&&!previous)RequestRead(true,false);}
+            }else{GenericError=snapshot.Error;GenericHealthSummary="读取组件暂不可用";GenericIdleSummary=null;GenericIdleCount=0;BlockWirelessDpi();foreach(var device in WirelessDevices){device.Fresh=false;device.Charging=null;}}
+            if(complete){string state=GenericError??GenericHealthSummary??"ready";ThreadPool.QueueUserWorkItem(delegate{SafeDiagnostic.Transition("device_readers",state);});}
+            UpdateIcon();
+        }
+        public bool IsDeviceRefreshing(string id){if(genericBusy==0)return false;if(genericPhysicalTarget!=null){var device=FindWirelessDpiDevice(id);return device!=null&&device.PhysicalId==genericPhysicalTarget;}return genericTarget==null||genericTarget==id;}
+        public void ClearReadingHistory(){
+            if(clearingHistory)return;clearingHistory=true;Interlocked.Increment(ref historyGeneration);BlockWirelessDpi();wirelessCache.Clear();if(Current==null||!UiState.Recent(Current.TimestampUtc,DateTime.UtcNow,90)){Current=null;LastGood=null;}else LastGood=Current;lastKnownHeadset=null;
+            foreach(var device in WirelessDevices)if(!device.Fresh){device.Percent=null;device.ConfirmedAtUtc=null;device.Charging=null;device.SourceQuality="unknown";}
+            if(Headset!=null&&!UiState.Recent(Headset.BatteryTimestampUtc,DateTime.UtcNow,90))Headset.Percent=null;
+            ThreadPool.QueueUserWorkItem(delegate{bool ok=fileWriter.Flush(5000);if(ok)foreach(string name in new[]{"readings-cache.json","wireless-cache.json"}){string path=Path.Combine(DeviceSettings.DataDirectory,name);try{fileWriter.Forget(path);if(File.Exists(path))File.Delete(path);}catch(IOException){ok=false;}catch(UnauthorizedAccessException){ok=false;}catch(InvalidOperationException){ok=false;}}
+                if(genericWorker!=null)genericWorker.Reset();if(!disposed)try{dispatch.BeginInvoke((MethodInvoker)delegate{clearingHistory=false;genericQueued=false;genericQueuedTarget=null;if(details!=null&&!details.IsDisposed)details.Notice(ok?"历史读数已清除":"本地缓存仍被占用，请稍后重试");RefreshBattery(false);});}catch(InvalidOperationException){}});UpdateIcon();
+        }
+        public string DiagnosticSummary() {
+            var now=DateTime.UtcNow;var mouse=UiState.Mouse(Current,LastGood,now);var headset=UiState.Headset(Headset,now);
+            var text="MyFinder Device Battery "+AppRuntime.Version+"\r\nWindows "+WindowsVersion.Read()+"\r\n当前实例："+processId+" / "+processStartedAtUtc.ToString("o")+"\r\n诊断写入："+StorageHealthText+"\r\n鼠标："+mouse.Tooltip+"\r\n耳机："+headset.Tooltip+
+                "\r\n耳机无线："+(ShowHeadset(Headset,Audio)?"已确认连接":"未确认连接")+"\r\n音源："+(Audio==null?"未确认":Audio.ActiveOutput)+
+                "\r\n后台间隔："+DeviceSettings.Current.BackgroundSeconds+"秒\r\n自启："+PopupPages.StartupState();
+            text+="\r\n软件更新："+UpdateStatus;if(!String.IsNullOrEmpty(UpdateFailure))text+="\r\n上次更新失败："+UpdateFailure;
+            text+="\r\n"+DevicePackDiagnostic;
+            if(!String.IsNullOrEmpty(ErrorMessage))text+="\r\n鼠标读取："+SafeDiagnostic.Clean(ErrorMessage);
+            if(!String.IsNullOrEmpty(DpiError))text+="\r\nDPI读取："+SafeDiagnostic.Clean(DpiError);
+            foreach(var device in WirelessDevices)text+="\r\n"+device.Kind+"："+WirelessLayout.View(device).Tooltip+(device.ModelSource=="pack"?" | 来自数据包，待验证":"");
+            text+="\r\n通用读取："+(GenericReady?"已就绪":GenericScanning?"识别中":"尚未就绪")+"\r\n读取健康："+(GenericError??GenericHealthSummary??GenericIdleSummary??"正常");foreach(var item in GenericHealth)if(item.State!="ok"&&item.State!="no_devices")text+="\r\n"+item.Provider+"："+item.State+" / "+item.ErrorCode;
+            text+="\r\n未取得电量的设备（可能未适配，也可能正在休眠）";
+            if(unadaptedDevices.Length==0)text+="\r\n无记录";
+            foreach(var device in unadaptedDevices)text+="\r\n"+device.DiagnosticLine();
+            text+="\r\n已隐藏的重复连接";
+            if(suppressedDevices.Length==0)text+="\r\n无记录";
+            foreach(var device in suppressedDevices)text+="\r\n"+FeedbackReport.CleanField(device.Name)+" | "+device.Kind;
+            return String.Join(Environment.NewLine,Array.ConvertAll(text.Split(new[]{"\r\n"},StringSplitOptions.None),delegate(string line){return SafeDiagnostic.Clean(line);}));
+        }
+        internal FeedbackReport CreateFeedbackReport(){
+            var cards=new List<WirelessDevice>();
+            foreach(var card in WirelessLayout.Build(this,0,100000).All){
+                if(card.Device!=null)cards.Add(card.Device);
+                else if(card.NativeMouse){var reading=Current??LastGood;cards.Add(new WirelessDevice {Name=reading==null?"原生 ATK（未读到名称）":reading.Product,Kind="mouse",Provider="native_atk",Percent=card.Battery.Percent,MeasurementState=card.Battery.Fresh?"current":"cached",VendorId=0x373B,ProductId=0x1278});}
+                else if(card.NativeHeadset)cards.Add(new WirelessDevice {Name=Headset.Product,Kind="headset",Provider="native_hyperx",Percent=card.Battery.Percent,MeasurementState=card.Battery.Fresh?"current":"cached",VendorId=0x03F0,ProductId=0x098D});
+            }
+            var privateValues=new List<string> {processId.ToString(),processStartedAtUtc.ToString("o"),instanceId};
+            foreach(var device in WirelessDevices){privateValues.Add(device.Id);privateValues.Add(device.PhysicalId);}
+            if(Current!=null)privateValues.Add(Current.DeviceKey);if(LastGood!=null)privateValues.Add(LastGood.DeviceKey);
+            if(Audio!=null){
+                privateValues.AddRange(new[]{Audio.SpeakerName,Audio.HeadsetName,Audio.MicrophoneName,Audio.SpeakerId,Audio.HeadsetId,Audio.MicrophoneId,Audio.ConsoleOutputId,Audio.MultimediaOutputId,Audio.CommunicationsOutputId,Audio.VolumeEndpointId});
+                foreach(var device in Audio.Devices??new AudioDeviceChoice[0])if(device!=null){privateValues.Add(device.Name);privateValues.Add(device.Id);}
+            }
+            return new FeedbackReport(AppRuntime.Version,WindowsVersion.Read(),cards,suppressedDevices,unadaptedDevices,GenericHealth,privateValues,DevicePackDiagnostic);
+        }
+        internal string OpenFeedback(Action<string> copy=null,Action<string> open=null){
+            var report=CreateFeedbackReport();
+            return new FeedbackBrowserSubmission(report.FullText,report.IssueUrl).Open(copy??Clipboard.SetText,open??delegate(string url){Process.Start(new ProcessStartInfo(url) {UseShellExecute=true});});
+        }
+        internal static bool ShowHeadset(HeadsetReading headset,AudioReading audio) {
+            return VisualDesign.ShouldShowHeadset(headset);
+        }
+        void RequestHeadsetRead(bool force) {
+            if(disposed||readHeadset==null)return;
+            if(headsetBusy!=0){if(force)pendingHeadsetRefresh=true;return;}
+            double interval=panelOpen?(headsetFailures==0?6:Math.Min(60,10*Math.Pow(2,Math.Min(headsetFailures-1,3)))):60;
+            if(!force&&(DateTime.UtcNow-headsetCheckedUtc).TotalSeconds<interval)return;
+            headsetBusy=1;
+            ThreadPool.QueueUserWorkItem(delegate {
+                HeadsetReading result;
+                try {result=readHeadset();}catch(Exception e){result=new HeadsetReading {Detail=e.Message};}
+                if(disposed)return;
+                try {dispatch.BeginInvoke((MethodInvoker)delegate {
+                    if(disposed)return;
+                    headsetBusy=0;headsetCheckedUtc=DateTime.UtcNow;
+                    if(result==null)result=new HeadsetReading {Detail="Headset query returned no state"};
+                    if(result.ConnectionVerified) {
+                        headsetFailures=0;
+                        if(result.Connected&&!result.Percent.HasValue&&lastKnownHeadset!=null&&lastKnownHeadset.Connected) {
+                            result.Percent=lastKnownHeadset.Percent;result.BatteryTimestampUtc=lastKnownHeadset.BatteryTimestampUtc;
+                        }
+                        lastKnownHeadset=result;
+                    } else {
+                        headsetFailures++;
+                        if((result.ReceiverPresent||!result.ReceiverPresenceVerified)&&lastKnownHeadset!=null) {
+                            result.ReceiverPresent=lastKnownHeadset.ReceiverPresent;
+                            result.ConnectionTimestampUtc=lastKnownHeadset.ConnectionTimestampUtc;
+                            result.Connected=lastKnownHeadset.Connected&&(DateTime.UtcNow-lastKnownHeadset.ConnectionTimestampUtc).TotalSeconds<120;
+                            if(result.Connected){result.Percent=lastKnownHeadset.Percent;result.BatteryTimestampUtc=lastKnownHeadset.BatteryTimestampUtc;}
+                        }
+                        if(!result.ReceiverPresent&&result.ReceiverPresenceVerified)lastKnownHeadset=null;
+                    }
+                    Headset=result;UpdateIcon();if(pendingHeadsetRefresh){pendingHeadsetRefresh=false;RequestHeadsetRead(true);}
+                });}catch(ObjectDisposedException){}catch(InvalidOperationException){}
+            });
+        }
+        void RequestAudioRead(bool force) {
+            if(disposed||readAudio==null)return;
+            if(audioBusy!=0){if(force)pendingAudioRefresh=true;return;}
+            if(!force&&(DateTime.UtcNow-audioCheckedUtc).TotalSeconds<(panelOpen?(audioEvents!=null&&audioEvents.Ready?10:2):60))return;
+            RunAudioOperation(readAudio);
+        }
+        void ClearPendingAudioCommands() {
+            pendingAudioOutput=null;pendingMicrophoneMute=null;pendingVolume=null;pendingVolumeEndpoint=null;
+            pendingOutputCommand=null;pendingMuteCommand=null;pendingVolumeCommand=null;
+        }
+        AudioCommand AudioRequest(string operation,string endpoint) {
+            return new AudioCommand {Operation=operation,Endpoint=endpoint,Settings=AudioScopeSettings};
+        }
+        void RunAudioOperation(Func<AudioReading> operation,AudioCommand command=null) {
+            if(disposed||audioBusy!=0)return;
+            var request=command??AudioRequest("read",null);int generation=audioGeneration;
+            audioBusy=1;audioOperationStarted=DateTime.UtcNow;operationTimer.Start();
+            if(details!=null&&!details.IsDisposed)details.Invalidate();
+            ThreadPool.QueueUserWorkItem(delegate {
+                AudioReading result=null;try {if(Thread.VolatileRead(ref audioGeneration)==generation)result=writeAudioCommand!=null?writeAudioCommand(request):operation();}catch(Exception e){result=new AudioReading {Error=e.Message};}
+                if(disposed)return;
+                try {dispatch.BeginInvoke((MethodInvoker)delegate {
+                    if(disposed)return;audioBusy=0;operationTimer.Stop();
+                    bool wasWrite=request.Operation!="read";
+                    if(generation!=audioGeneration){pendingAudioRefresh=true;}
+                    else {
+                        if(result==null)result=new AudioReading {Error="音频接口未返回状态。",TimestampUtc=DateTime.UtcNow};
+                        // Empty defaults are a valid complete snapshot. Failed reads
+                        // also replace old data, while controls wait for a fresh read.
+                        Audio=result;
+                        if(result.OperationSucceeded&&!result.OutcomeUnknown){if(!wasWrite)audioNeedsReconcile=false;}
+                        else {
+                            audioNeedsReconcile=true;ClearPendingAudioCommands();pendingAudioRefresh|=wasWrite;
+                            if(String.IsNullOrEmpty(result.Error))result.Error="音频状态未确认。";
+                            audioActionFailure=result.Error;audioFailureAt=DateTime.UtcNow;
+                        }
+                        if(audioEvents!=null)audioEvents.SetMicrophoneTarget(result.MicrophoneId);
+                    }
+                    microphoneTargetInFlight=null;audioTargetInFlight=null;volumeTargetInFlight=null;audioCheckedUtc=DateTime.UtcNow;
+                    UpdateIcon();RunPendingAudio();
+                });}catch(ObjectDisposedException){}catch(InvalidOperationException){}
+            });
+        }
+        public void SelectAudioOutput(string target) {
+            if(writeOutput==null||audioNeedsReconcile||target!="speaker"&&target!="headset")return;
+            if(Audio==null||target=="speaker"&&!Audio.SpeakerAvailable||target=="headset"&&!Audio.HeadsetAvailable)return;
+            string endpoint=target=="speaker"?Audio.SpeakerId:Audio.HeadsetId;if(String.IsNullOrEmpty(endpoint))return;
+            if(target==pendingAudioOutput||target==audioTargetInFlight&&pendingAudioOutput==null)return;
+            audioActionFailure=null;actionRequestedAt=DateTime.UtcNow;pendingAudioOutput=target;pendingOutputCommand=AudioRequest("output",endpoint);pendingOutputCommand.Target=target;RunPendingAudio();
+            if(details!=null&&!details.IsDisposed)details.Invalidate();
+        }
+        public void ToggleMicrophoneMute() {
+            if(writeMute==null||audioNeedsReconcile||Audio==null||!Audio.MicrophoneAvailable||String.IsNullOrEmpty(Audio.MicrophoneId)||!Audio.MicrophoneMuted.HasValue)return;
+            audioActionFailure=null;actionRequestedAt=DateTime.UtcNow;pendingMicrophoneMute=!(pendingMicrophoneMute??microphoneTargetInFlight??Audio.MicrophoneMuted.Value);pendingMuteCommand=AudioRequest("mute",Audio.MicrophoneId);pendingMuteCommand.Mute=pendingMicrophoneMute.Value;RunPendingAudio();
+            if(details!=null&&!details.IsDisposed)details.Invalidate();
+        }
+        public void SelectOutputVolume(string endpoint,int percent) {
+            if(writeVolume==null||audioNeedsReconcile||Audio==null||String.IsNullOrEmpty(endpoint)||percent<0||percent>100)return;
+            if(audioScopeDeviceId!=null&&(String.IsNullOrEmpty(Audio.VolumeEndpointId)||!AudioControl.SameId(endpoint,Audio.VolumeEndpointId)))return;
+            audioActionFailure=null;pendingVolume=percent;pendingVolumeEndpoint=endpoint;pendingVolumeCommand=AudioRequest("volume",endpoint);pendingVolumeCommand.Percent=percent;RunPendingAudio();
+            if(details!=null&&!details.IsDisposed)details.Invalidate();
+        }
+        void RunPendingAudio() {
+            if(disposed||audioBusy!=0)return;
+            if(audioNeedsReconcile){if(pendingAudioRefresh){pendingAudioRefresh=false;RunAudioOperation(readAudio);}return;}
+            if(pendingAudioOutput!=null) {
+                string target=pendingAudioOutput;var command=pendingOutputCommand;pendingAudioOutput=null;pendingOutputCommand=null;audioTargetInFlight=target;
+                RunAudioOperation(delegate {return writeOutput(target);},command);
+            } else if(pendingMicrophoneMute.HasValue) {
+                bool mute=pendingMicrophoneMute.Value;var command=pendingMuteCommand;pendingMicrophoneMute=null;pendingMuteCommand=null;
+                microphoneTargetInFlight=mute;
+                RunAudioOperation(delegate {return writeMute(mute);},command);
+            } else if(pendingVolume.HasValue) {
+                int value=pendingVolume.Value;string endpoint=pendingVolumeEndpoint;var command=pendingVolumeCommand;pendingVolume=null;pendingVolumeEndpoint=null;pendingVolumeCommand=null;volumeTargetInFlight=value;
+                RunAudioOperation(delegate {return writeVolume(endpoint,value);},command);
+            } else if(pendingAudioRefresh) {
+                pendingAudioRefresh=false;RunAudioOperation(readAudio);
+            }
+        }
+        void BuildAudioSettingsMenu() {
+            while(audioSettingsMenu.DropDownItems.Count>0)audioSettingsMenu.DropDownItems[0].Dispose();
+            AudioBindings bindings;
+            try {bindings=DeviceSettings.Current;}
+            catch(Exception e){bindings=new AudioBindings();audioSettingsMenu.DropDownItems.Add(new ToolStripMenuItem("无法读取设置："+e.Message){Enabled=false});}
+            foreach(string roleValue in new[]{"speaker","headset","microphone"}) {
+                string role=roleValue;
+                var group=new ToolStripMenuItem(role=="speaker"?"扬声器按钮":role=="headset"?"耳机按钮":"麦克风按钮");
+                string selected=bindings.EndpointFor(role);
+                var automatic=new ToolStripMenuItem("自动识别（默认）"){Checked=String.IsNullOrEmpty(selected)};
+                automatic.Click+=delegate {SaveAudioEndpoint(role,null);};group.DropDownItems.Add(automatic);
+                group.DropDownItems.Add(new ToolStripSeparator());
+                int count=0;bool selectedFound=false;
+                if(Audio!=null&&Audio.Devices!=null)foreach(var device in Audio.Devices) {
+                    if(device.Flow!=(role=="microphone"?1:0))continue;
+                    string id=device.Id;
+                    string label=String.IsNullOrWhiteSpace(device.Name)?"未命名设备":device.Name;
+                    bool isSelected=String.Equals(id,selected,StringComparison.OrdinalIgnoreCase);
+                    var item=new ToolStripMenuItem(label.Replace("&","&&")){Checked=isSelected,ToolTipText=device.InterfaceName??label};
+                    item.Click+=delegate {SaveAudioEndpoint(role,id);};group.DropDownItems.Add(item);
+                    count++;selectedFound|=isSelected;
+                }
+                if(count==0)group.DropDownItems.Add(new ToolStripMenuItem("未发现设备，请刷新列表"){Enabled=false});
+                if(!String.IsNullOrEmpty(selected)&&!selectedFound)group.DropDownItems.Add(new ToolStripMenuItem("当前绑定设备未连接"){Enabled=false,Checked=true});
+                audioSettingsMenu.DropDownItems.Add(group);
+            }
+            audioSettingsMenu.DropDownItems.Add(new ToolStripSeparator());
+            var refreshDevices=new ToolStripMenuItem("刷新设备列表");refreshDevices.Click+=delegate {RequestAudioRead(true);};audioSettingsMenu.DropDownItems.Add(refreshDevices);
+            var reset=new ToolStripMenuItem("恢复默认音源识别");reset.Click+=delegate {
+                try {DeviceSettings.ResetAudio();ConfigurationChanged();}
+                catch(Exception e){ThemedMessage.Show(null,"设备电量","无法保存音源设置："+e.Message,MessageBoxButtons.OK);}
+            };audioSettingsMenu.DropDownItems.Add(reset);
+        }
+        void SaveAudioEndpoint(string role,string id) {
+            try {DeviceSettings.SetEndpoint(role,id);ConfigurationChanged();}
+            catch(Exception e){ThemedMessage.Show(null,"设备电量","无法保存音源设置："+e.Message,MessageBoxButtons.OK);}
+        }
+        void RequestRead(bool includeBattery,bool queueWhenBusy) {
+            if(persistStatus&&!NativeMousePresent)return;
+            if(disposed||busy!=0&&!queueWhenBusy)return;
+            pendingRead=true;pendingBattery|=includeBattery;RunNext();
+        }
+        public void SelectDpiStage(int stage,string expectedToken=null) {
+            if(!CanSetNativeDpi||Dpi.Stages==null||stage<0||stage>=Dpi.Stages.Count||expectedToken!=null&&expectedToken!=NativeDpiToken)return;
+            if(UiState.SkipConfirmedStage(Dpi,DpiError,stage,switching||pendingStage>=0,DateTime.UtcNow))return;
+            if(pendingStage==stage||stageInFlight==stage&&pendingStage<0)return;
+            dpiActionFailure=null;actionRequestedAt=DateTime.UtcNow;
+            int epoch=Thread.VolatileRead(ref nativeEpoch);
+            pendingNativeDpi=new NativeDpiRequest(Dpi,stage,epoch,delegate{return !disposed&&Thread.VolatileRead(ref nativeEpoch)==epoch;});
+            pendingStage=stage;RunNext();if(details!=null&&!details.IsDisposed)details.Invalidate();SaveStatus();
+        }
+        void RunNext() {
+            if(disposed||busy!=0||pendingStage<0&&!pendingRead)return;
+            int stage=pendingStage,epoch=Thread.VolatileRead(ref nativeEpoch);bool includeBattery=pendingBattery;var request=pendingNativeDpi;
+            if(stage>=0){pendingStage=-1;pendingNativeDpi=null;}
+            else {pendingRead=false;pendingBattery=false;}
+            busy=1;switching=stage>=0;stageInFlight=stage;
+            if(details!=null&&!details.IsDisposed)details.Invalidate();SaveStatus();
+            ThreadPool.QueueUserWorkItem(delegate {
+                MouseSnapshot snapshot=null;DpiConfig switched=null;string failure=null;
+                try {if(stage>=0){if(request==null)throw new InvalidOperationException("Missing DPI target identity.");request.CheckCurrent();switched=writeNativeDpi!=null?writeNativeDpi(request):selectStage(stage);}else snapshot=readSnapshot(includeBattery);}catch(Exception e){failure=e.Message;}
+                if(disposed)return;
+                try {dispatch.BeginInvoke((MethodInvoker)delegate {
+                    if(disposed)return;
+                    if(epoch!=Thread.VolatileRead(ref nativeEpoch)){
+                        discardedNativeResults++;busy=0;switching=false;stageInFlight=-1;nativeNeedsReconcile=true;pendingRead=true;pendingBattery=true;UpdateIcon();RunNext();DrainActivityRefresh();return;
+                    }
+                    if(stage>=0) {
+                        bool matched=switched!=null&&request!=null&&switched.DeviceKey==request.DeviceKey&&switched.ActiveStage==request.Stage&&switched.Stages!=null&&switched.Stages.Count==request.StageCount&&switched.Stages[request.Stage].XDpi==request.XDpi&&switched.Stages[request.Stage].YDpi==request.YDpi&&UiState.Recent(switched.TimestampUtc,DateTime.UtcNow,90);
+                        if(matched){Dpi=switched;DpiError=switched.RefreshError??"";completedSwitches++;nativeNeedsReconcile=!String.IsNullOrEmpty(DpiError);}
+                        else {DpiError=failure??"DPI switch did not return a verified target result";dpiActionFailure=DpiError;dpiFailureAt=DateTime.UtcNow;nativeNeedsReconcile=true;pendingStage=-1;pendingNativeDpi=null;}
+                        pendingRead=true;pendingBattery=true;
+                    } else {
+                        completedReads++;
+                        if(snapshot!=null) {
+                            string key=snapshot.DeviceKey??(snapshot.Dpi==null?null:snapshot.Dpi.DeviceKey);
+                            if(MouseBattery.ValidDeviceKey(key)&&nativeDeviceKey!=null&&key!=nativeDeviceKey){Interlocked.Increment(ref nativeEpoch);pendingStage=-1;pendingNativeDpi=null;Dpi=null;LastGood=null;}
+                            if(MouseBattery.ValidDeviceKey(key))nativeDeviceKey=key;
+                            if(includeBattery){Current=snapshot.Battery;ErrorMessage=snapshot.BatteryError;if(Current!=null)LastGood=Current;}
+                            if(snapshot.Dpi!=null){Dpi=snapshot.Dpi;DpiError=snapshot.DpiError??"";}else DpiError=snapshot.DpiError??failure??"DPI read did not return a verified result";
+                            nativeNeedsReconcile=snapshot.Dpi==null||!MouseBattery.ValidDeviceKey(snapshot.Dpi.DeviceKey)||!String.IsNullOrEmpty(DpiError);
+                        } else {if(includeBattery){Current=null;ErrorMessage=failure;}DpiError=failure;nativeNeedsReconcile=true;}
+                    }
+                    busy=0;switching=false;stageInFlight=-1;lastSyncUtc=DateTime.UtcNow;if(stage<0&&includeBattery)CompleteNativeActivity();UpdateIcon();RunNext();DrainActivityRefresh();
+                });}catch(ObjectDisposedException){}catch(InvalidOperationException){}
+            });
+        }
+        protected override void ExitThreadCore() {
+            if(updates!=null)updates.Dispose();
+            if(feedbackChecks!=null)feedbackChecks.Dispose();if(feedbackDialog!=null&&!feedbackDialog.IsDisposed)feedbackDialog.Close();
+            if(devicePackChecks!=null)devicePackChecks.Dispose();
+            if(updatedPanelRequest!=null)updatedPanelRequest.Dispose();
+            disposed=true;if(mouseActivity!=null)mouseActivity.Dispose();activityTimer.Stop();activityTimer.Dispose();activityRefresh.Dispose();refresh.Stop();refresh.Dispose();liveSync.Stop();liveSync.Dispose();deviceDebounce.Stop();deviceDebounce.Dispose();expiryTimer.Dispose();audioDebounce.Dispose();operationTimer.Dispose();if(deviceEvents!=null)deviceEvents.Dispose();if(audioEvents!=null){var listener=audioEvents;ThreadPool.QueueUserWorkItem(delegate{listener.Dispose();});}tray.Visible=false;MacroEngine.Stop();
+            if(genericWorker!=null)genericWorker.Dispose();
+            if(persistStatus)AudioBrokerClient.Shutdown();fileWriter.Dispose();
+            if(details!=null)details.Close();var menu=tray.ContextMenuStrip;trayIcons.Dispose();if(menu!=null)menu.Dispose();dispatch.Dispose();base.ExitThreadCore();
+        }
+    }
+    static class Program {
+        [System.Runtime.Serialization.DataContract] sealed class PackageSmokeRelease {
+            [System.Runtime.Serialization.DataMember(Name="schema")] public int Schema;
+            [System.Runtime.Serialization.DataMember(Name="appId")] public string AppId;
+            [System.Runtime.Serialization.DataMember(Name="version")] public string Version;
+            [System.Runtime.Serialization.DataMember(Name="providerCount")] public int ProviderCount;
+        }
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern short GetAsyncKeyState(int key);
+
+        [STAThread] static void Main(string[] args) {
+            // Offline entry points run before single-instance, UI, settings or hardware initialization.
+            if(args.Length==6&&args[0]=="--verify-update-package"){
+                try{
+                    string version=args[4];if(UpdateVersion.Parse(version).CompareTo(UpdateVersion.Parse(AppRuntime.Version))<=0)throw new InvalidDataException("Update downgrade refused.");
+                    byte[] sums=UpdateJson.ReadBytes(args[2],262144),signature=UpdateJson.ReadBytes(args[3],16384);
+                    UpdatePackageVerifier.VerifyAndExtract(args[1],sums,signature,UpdateTrust.PublicKeyXml,args[5],version,CancellationToken.None);
+                }catch(Exception){Environment.ExitCode=1;}return;
+            }
+            if(args.Length==3&&args[0]=="--validate-update-directory"){
+                try{UpdateVersion.Parse(args[2]);UpdatePackageVerifier.ValidateDirectory(Path.GetFullPath(args[1]),args[2],CancellationToken.None);}catch(Exception){Environment.ExitCode=1;}return;
+            }
+            if(args.Length>0&&args[0]=="--validate-update-archive"){
+                try{
+                    if(args.Length!=4)throw new ArgumentException("Expected archive, fresh directory and version.");
+                    UpdatePackageVerifier.ExtractAndValidate(Path.GetFullPath(args[1]),Path.GetFullPath(args[2]),args[3],CancellationToken.None);
+                }catch(Exception){Environment.ExitCode=1;}return;
+            }
+            if(args.Length==1&&args[0]=="--audio-broker"){AudioBrokerClient.RunServer();return;}
+            if(args.Length==1&&args[0]=="--exit"){using(var stop=new ShowPanelSignal("Local\\MyFinderDeviceBattery.Exit"))stop.Request();return;}
+            if(args.Length==2&&args[0]=="--macro-selftest"){
+                var report=new System.Text.StringBuilder();
+                try{
+                    int before=MacroStore.All.Count;
+                    var macro=MacroStore.Add("自检宏");
+                    macro.Trigger="key:0x70";macro.Enabled=true;
+                    macro.Steps.Add(new MacroStep {Kind="keydown",Value=0x41,DelayMs=0});
+                    macro.Steps.Add(new MacroStep {Kind="keyup",Value=0x41,DelayMs=10});
+                    MacroStore.Save();
+                    MacroStore.Reload();
+                    var loaded=MacroStore.FindByTrigger("key:0x70");
+                    report.AppendLine("saved="+(loaded!=null)+" steps="+(loaded!=null&&loaded.Steps!=null?loaded.Steps.Count:0)+" enabledCount="+MacroStore.EnabledCount());
+                    MacroEngine.Start();
+                    report.AppendLine("hooks="+MacroEngine.Running+" error="+(MacroEngine.LastError==null?"":MacroEngine.LastError));
+                    MacroEngine.Stop();
+                    MacroStore.Reload();
+                    MacroDefinition found=null;
+                    foreach(var item in MacroStore.All) if(item.Id==macro.Id){found=item;break;}
+                    if(found!=null) MacroStore.Remove(found);
+                    MacroStore.Save();
+                    MacroStore.Reload();
+                    report.AppendLine("cleaned="+(MacroStore.All.Count==before));
+                }catch(Exception error){report.AppendLine("ERROR "+error.GetType().Name+": "+error.Message);}
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==2&&args[0]=="--macro-play-selftest"){
+                var report=new System.Text.StringBuilder();
+                try{
+                    var macro=new MacroDefinition {Name="play-selftest",Enabled=true,Trigger=null,Steps=new List<MacroStep>()};
+                    macro.Steps.Add(new MacroStep {Kind="keydown",Value=0x87,DelayMs=0});
+                    macro.Steps.Add(new MacroStep {Kind="keyup",Value=0x87,DelayMs=400});
+                    MacroPlayer.Play(macro);
+                    bool down=false,up=false;
+                    for(int i=0;i<100;i++){
+                        Thread.Sleep(10);
+                        bool state=(GetAsyncKeyState(0x87)&0x8000)!=0;
+                        if(state) down=true;
+                        if(down&&!state) up=true;
+                    }
+                    for(int i=0;i<50;i++){if(!MacroPlayer.IsPlaying)break;Thread.Sleep(10);}
+                    report.AppendLine("keyDownSeen="+down+" keyUpSeen="+up+" finished="+(!MacroPlayer.IsPlaying));
+                }catch(Exception error){report.AppendLine("ERROR "+error.GetType().Name+": "+error.Message);}
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==2&&args[0]=="--macro-inspect"){
+                var report=new System.Text.StringBuilder();
+                try{
+                    MacroStore.Reload();
+                    report.AppendLine("count="+MacroStore.All.Count);
+                    foreach(var macro in MacroStore.All) report.AppendLine("- "+macro.Name+" trigger="+macro.Trigger+" enabled="+macro.Enabled+" steps="+(macro.Steps==null?0:macro.Steps.Count));
+                    var found=MacroStore.FindByTrigger("key:0x87");
+                    report.AppendLine("findF24="+(found!=null));
+                }catch(Exception error){report.AppendLine("ERROR "+error.GetType().Name+": "+error.Message);}
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==3&&args[0]=="--peripheral-ui-selftest"){
+                Application.EnableVisualStyles();
+                using(var form=new PeripheralHubForm()){
+                    form.Opacity=0;form.Show();Application.DoEvents();
+                    using(var bitmap=new System.Drawing.Bitmap(form.Width,form.Height)){
+                        form.DrawToBitmap(bitmap,new System.Drawing.Rectangle(0,0,form.Width,form.Height));
+                        bitmap.Save(args[1],System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    File.WriteAllText(args[2],form.DebugSummary(),new UTF8Encoding(false));
+                    form.Close();
+                }
+                return;
+            }
+            if(args.Length==2&&args[0]=="--peripheral-selftest"){
+                var report=new System.Text.StringBuilder();
+                int installed=0;
+                foreach(var app in PeripheralCatalog.All){
+                    if(app.Installed)installed++;
+                    report.AppendLine(app.Id+" | "+app.Category+" | installed="+app.Installed+" | web="+app.WebOnly+" | "+app.Status+" | "+(app.Path==null?"":app.Path));
+                }
+                report.AppendLine("TOTAL="+PeripheralCatalog.All.Count+" INSTALLED="+installed);
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==2&&args[0]=="--startup-selftest"){
+                var report=new System.Text.StringBuilder();
+                bool initial=StartupManager.IsEnabled();
+                try{
+                    report.AppendLine("initial="+initial+" exists="+File.Exists(StartupManager.CurrentShortcutPath));
+                    bool enabled=StartupManager.SetEnabled(true);bool readEnabled=StartupManager.IsEnabled();
+                    report.AppendLine("enable="+enabled+" readEnabled="+readEnabled+" exists="+File.Exists(StartupManager.CurrentShortcutPath));
+                    bool disabled=StartupManager.SetEnabled(false);bool readDisabled=StartupManager.IsEnabled();
+                    report.AppendLine("disable="+disabled+" readDisabled="+readDisabled+" exists="+File.Exists(StartupManager.CurrentShortcutPath));
+                }catch(Exception error){report.AppendLine("ERROR "+error.GetType().Name+": "+error.Message);}
+                finally{StartupManager.SetEnabled(initial);report.AppendLine("restored="+StartupManager.IsEnabled()+" exists="+File.Exists(StartupManager.CurrentShortcutPath));}
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==2&&args[0]=="--startup-set"){
+                bool want=args[1]=="1";bool ok=StartupManager.SetEnabled(want);
+                Environment.ExitCode=ok?0:2;return;
+            }
+            if(args.Length==2&&args[0]=="--rapoo-selftest"){
+                var report=new System.Text.StringBuilder();
+                try{
+                    int percent=-1;bool charging=false;bool present=RapooHid.ProbeBattery(out percent,out charging);
+                    report.AppendLine("probe="+present+" pct="+percent+" charging="+charging);
+                    using(var mouse=RapooHid.Open()){
+                        if(mouse==null){report.AppendLine("NOT_FOUND");}
+                        else{
+                            report.AppendLine("pid=0x"+mouse.ProductId.ToString("X4")+" wired="+mouse.Wired+" cfg="+mouse.ConfigIndex);
+                            int rate=mouse.ReadReportRateCode();int gear=mouse.ReadCurrentGear();int enabled=mouse.ReadEnabledGearCount();
+                            report.AppendLine("rate="+rate+" gear="+gear+" enabled="+enabled);
+                            bool ok=mouse.WriteReportRateCode(rate);report.AppendLine("writeRate="+ok+" readBack="+mouse.ReadReportRateCode());
+                            bool ok2=mouse.WriteCurrentGear(gear);report.AppendLine("writeGear="+ok2+" readBack="+mouse.ReadCurrentGear());
+                            int battery=-1;bool state=false;
+                            for(int i=0;i<4;i++){if(mouse.TryReadBattery(out battery,out state,800))break;}
+                            report.AppendLine("battery="+battery+" charging="+state);
+                        }
+                    }
+                }catch(Exception error){report.AppendLine("ERROR "+error.GetType().Name+": "+error.Message);}
+                File.WriteAllText(args[1],report.ToString(),new UTF8Encoding(false));
+                return;
+            }
+            if(args.Length==1&&args[0]=="--package-smoke"){
+                using(var output=new StreamWriter(Console.OpenStandardOutput(),new UTF8Encoding(false)) {AutoFlush=true})try{
+                    string root=Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,".."));
+                    var release=UpdateJson.ReadFile<PackageSmokeRelease>(Path.Combine(root,"release.json"),65536);
+                    if(release==null||release.Schema!=1||release.AppId!="myfinder-device-battery"||release.Version!=AppRuntime.Version||release.ProviderCount<=0)throw new InvalidDataException("Invalid package reader count.");
+                    using(var worker=new GenericBatteryWorker(null,true)){
+                        var snapshot=worker.Poll(true);
+                        bool ok=String.IsNullOrEmpty(snapshot.Error)&&snapshot.Errors!=null&&snapshot.Errors.Length==0&&snapshot.Complete&&
+                            snapshot.ProviderCount==release.ProviderCount&&snapshot.ImportedProviderCount==release.ProviderCount;
+                        output.WriteLine("{\"schema\":1,\"packageSmoke\":true,\"version\":\""+AppRuntime.Version+"\",\"providerCount\":"+snapshot.ProviderCount+",\"importedProviderCount\":"+snapshot.ImportedProviderCount+",\"error\":\""+(ok?"":"package_reader_failed")+"\"}");Environment.ExitCode=ok?0:1;
+                    }
+                }catch(Exception){output.WriteLine("{\"schema\":1,\"packageSmoke\":true,\"error\":\"package_smoke_failed\"}");Environment.ExitCode=1;}return;
+            }
+            NativeDisplay.EnableDpiAwareness();
+            if(args.Length==2 && args[0]=="--preview") {
+                Directory.CreateDirectory(args[1]);
+                using(var b=new Bitmap(900,430))
+                using(var g=Graphics.FromImage(b)) {
+                    g.Clear(Color.FromArgb(130,133,141));
+                    using(var bar=new SolidBrush(Color.FromArgb(245,246,248)))g.FillRectangle(bar,0,0,b.Width,55);
+                    using(var line=new Pen(Color.FromArgb(225,226,229),1))g.DrawLine(line,0,54,b.Width,54);
+                    Style.Text(g,"Finder 菜单栏常态（只占小图标位）",13,FontStyle.Regular,Color.FromArgb(100,101,106),new RectangleF(24,8,420,36),StringAlignment.Near);
+                    using(var trayPreview=TrayGlyph.Render(72,false,false,false,32))g.DrawImage(trayPreview,new RectangleF(820,14,27,27));
+                    Style.Text(g,"点击后展开",12,FontStyle.Regular,Color.FromArgb(100,101,106),new RectangleF(670,8,135,36),StringAlignment.Far);
+                    using(var shadow=new SolidBrush(Color.FromArgb(50,0,0,0)))g.FillRectangle(shadow,559,83,VisualDesign.PanelSize.Width,VisualDesign.PanelSize.Height);
+                    g.TranslateTransform(548,72);Details.PaintPanel(g,null,null,null,false,null,null,false,false);g.ResetTransform();
+                    Style.Text(g,"点击空白区域后动画缩回",13,FontStyle.Regular,Color.White,new RectangleF(560,350,280,28),StringAlignment.Center);
+                    b.Save(Path.Combine(args[1],"appearance-preview.png"),ImageFormat.Png);
+                }
+                return;
+            }
+            var request=PanelStartup.Parse(args);
+            bool fresh;using(var signal=new ShowPanelSignal())using(var updated=new ShowPanelSignal(PanelStartup.UpdatedSignalName))using(var stop=new ShowPanelSignal("Local\\MyFinderDeviceBattery.Exit"))using(var mutex=new Mutex(true,"Local\\ATK-A9-Air-Battery-Tray",out fresh)) {
+                if(!fresh){PanelStartup.Forward(request,signal,updated);return;}
+                Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
+                DialogVisibility.ConsumeStartupShowCommand();
+                var context=new TrayContext(request==PanelOpenRequest.Launcher);context.ListenForShowRequest(signal);context.ListenForShowRequest(updated,true);context.ListenForExitRequest(stop);
+                if(request==PanelOpenRequest.Updated)updated.Request();Application.Run(context);
+            }
+        }
+    }
+}

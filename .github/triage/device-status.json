@@ -1,0 +1,108 @@
+{
+  "schema": 1,
+  "devices": {
+    "0B05:1ACE": {
+      "status": "beta",
+      "version": "1.3.11-beta.2",
+      "note": "仅鼠标；经 OMNI 接收器连接的键盘暂不支持",
+      "reports": 0
+    },
+    "0B05:1AD0": {
+      "status": "beta",
+      "version": "1.3.11-beta.11",
+      "note": "仅龙鳞 2 Ace 的 SPEEDNOVA 8K 接收器",
+      "reports": 0
+    },
+    "187C:0551": {
+      "status": "not-a-device",
+      "note": "电脑机身的灯效控制器，本身没有电量",
+      "reports": 0
+    },
+    "1D57:FA65": {
+      "status": "beta",
+      "version": "1.3.11-beta.5",
+      "note": "候选修复，读不到请补交一次诊断",
+      "reports": 0
+    },
+    "248A:5B2F": {
+      "status": "no-evidence",
+      "reports": 6,
+      "rank": 16
+    },
+    "260D:1074": {
+      "status": "beta",
+      "version": "1.3.11-beta.13",
+      "note": "仅 CM610 Pro 分离接口候选，EM901 仍用原路径",
+      "reports": 0
+    },
+    "3554:F503": {
+      "status": "beta",
+      "version": "1.3.11-beta.8",
+      "note": "F503接收器只读电量候选；请对照官方软件验证",
+      "reports": 0
+    },
+    "3554:FB26": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限 M900 Ultra 配 GH8K 接收器，仅电量",
+      "reports": 0
+    },
+    "3554:FB3E": {
+      "status": "beta",
+      "version": "1.3.11-beta.14",
+      "note": "限蜻蜓 F2 Pro Max 和 Y2 Pro 的 2.4G 电量，充电状态未知"
+    },
+    "3837:100C": {
+      "status": "beta",
+      "version": "1.3.11-beta.9",
+      "note": "仅A5 V2 Ultra只读电量候选；不含DPI，待实机验证",
+      "reports": 0
+    },
+    "3837:1012": {
+      "status": "not-a-device",
+      "note": "充电底座，本身没有电量",
+      "reports": 0
+    },
+    "3837:6011": {
+      "status": "no-evidence",
+      "reports": 9,
+      "rank": 4
+    },
+    "391D:1A04": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限蜻蜓 3 Pro Max 的 ryMs 2.4G 接收器，仅电量",
+      "reports": 0
+    },
+    "391D:1A08": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限 Y2 V2 Pro Max 的 MI_01 指定集合，仅电量",
+      "reports": 0
+    },
+    "391D:1A13": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限 F1 V2 Pro Max 的 MI_01 指定集合，仅电量",
+      "reports": 0
+    },
+    "391D:1A25": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限蜻蜓 3 Ultra 的 MI_01 指定集合，仅电量",
+      "reports": 0
+    },
+    "391D:1A2B": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限 F1 V5 Ultra 的 MI_01 指定集合，仅电量",
+      "reports": 0
+    },
+    "391D:1A41": {
+      "status": "beta",
+      "version": "1.3.11-beta.12",
+      "note": "限 F2 V2 Ultra 的 MI_01 指定集合，仅电量",
+      "reports": 0
+    }
+  }
+}

@@ -1,0 +1,33 @@
+﻿# Local temp and workspace data
+work/
+backups/
+logs/
+tmp/
+snapshots/
+inputs/upstream/
+inputs/runtime/
+engine/runtime/
+outputs/backend-runtime/
+__pycache__/
+*.pyc
+outputs/*.json
+outputs/*.exe
+outputs/appearance-preview.png
+outputs/active-ui-render.png
+outputs/releases/
+*.zip
+
+# Local test binaries and captures
+build-test/
+outputs/tests/
+tools/*.exe
+tools/*.log
+tools/*.out.txt
+tools/*.png
+tools/*.json
+
+# Build and IDE intermediates
+*.obj
+*.pdb
+*.suo
+*.user

@@ -1,0 +1,370 @@
+"""Rule-based, offline issue triage. No issue text is executed or echoed in replies.
+
+Usage: triage.py --issue issue.json --comments comments.json --known-ids released.json --known-ids-next main.json
+The comments file may be a flat list or gh api --paginate --slurp pages; without
+--comments, an embedded issue["comments"] list is used. A null label means no-op.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+
+
+MARKER = "<!-- myfinder-triage:v1 -->"
+# In-app supplements are relayed under the owner account with this prefix; they
+# are user content. Any other maintainer comment must not start a triage pass.
+SUPPLEMENT_PREFIX = "<!-- myfinder-supplement:v1 "
+MAINTAINER_ASSOCIATIONS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
+NEEDS_INFO = ("自动回复：这次反馈没有带上设备信息，我们没法判断是哪款设备。请在程序里打开‘反馈问题’，"
+              "勾选‘附带诊断信息’后重新提交，并在描述里写上本条编号；也可以在这里粘贴完整的反馈报告。维护者会尽快查看。")
+SUPPLEMENT_GUIDANCE = "请在程序里打开‘我的反馈’，选中这条后点‘补充资料’，勾选‘附带诊断信息’提交即可，不需要重新提交，也不需要 GitHub 账号。"
+NEEDS_INFO_WITH_REPLY = ("自动回复：这次反馈没有带上设备信息，我们没法判断是哪款设备。"
+                         + SUPPLEMENT_GUIDANCE + "维护者会尽快查看。")
+SUPPORTED = ("自动回复：报告里的 {models} 在支持列表中。如果还是没有电量，请依次试试："
+             "1）唤醒设备后在程序里点重新同步；2）暂时关闭厂商驱动后再试；3）拔插接收器。"
+             "仍不行的话，请在这里补充一次新的反馈报告；没有 GitHub 账号的话，可以在程序里重新提交反馈，并在描述里写上本条编号。维护者会尽快查看。")
+IN_NEXT_RELEASE = ("自动回复：报告里的 {models} 在开发代码已有读取实现，当前正式发布尚未包含，"
+                   "是否提供以实际发布为准，需实机验证，欢迎对照官方软件的读数。维护者会尽快查看。")
+MODEL_MATCH_REQUIRED = ("自动回复：报告中的设备 ID 仅部分型号可读取电量，需核对准确型号和接口，"
+                        "暂不能仅凭共享 ID 确认支持。请在这里补充一次新的反馈报告；没有 GitHub 账号的话，"
+                        "可以在程序里重新提交反馈，并在描述里写上本条编号。维护者会尽快查看。")
+UNSUPPORTED = "自动回复：这款设备目前还读不到电量。请先确认已升级到最新正式版；如果电脑上有官方软件能显示它的电量，请在这里回复软件名称、版本和下载地址，有了这个我们才能研究。我们每天查看一次反馈，有修复就会发布测试版。"
+BUG_ACK = "自动回复：收到你的反馈，维护者会定期查看并在这里回复。如果方便，请写清楚操作步骤和看到的现象，有截图更好。"
+PAIR = re.compile(r"(?<![\w:])([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})(?![\w:])")
+TYPE = re.compile(r"^[ \t]*(?:\*\*)?类型(?:\*\*)?[ \t]*[：:][ \t]*([^\r\n]+?)[ \t\r]*$", re.MULTILINE)
+DEVICE_TYPES = {"设备不识别", "电量或 DPI 不对"}
+BUG_TYPES = {"界面或操作", "其他"}
+RELEASES = "https://github.com/wushuai0802/myfinder-device-battery/releases"
+UPDATE_FAILURE_TITLE = re.compile(r"(?:新版本|测试版|beta(?:版本)?|软件|程序|内置)?(?:无法(?:自动)?更新|不能更新|更新不了|更新失败|更新超时|无法升级)[。！!]?", re.IGNORECASE)
+HEADINGS = {"有卡片的设备": "card", "未取得电量的设备": "unadapted",
+            "已隐藏的重复连接": "ignore", "读取器健康": "ignore"}
+LEGACY_CARD = re.compile(r"^(?:mouse|keyboard|headset|鼠标|键盘|耳机)[ \t]*[：:][ \t]*\S(?:.*\S)?[ \t]+\d{1,3}%",
+                         re.IGNORECASE)
+NOISE_NAME = re.compile(r"HIDI2C|Touchpad|Multitouch|Precision|Motherboard", re.IGNORECASE)
+REPLY_CREDENTIAL = re.compile(r"<!-- myfinder-reply:v1 sha256=[0-9a-f]{64} -->")
+STATUS_ID = re.compile(r"[0-9A-F]{4}:[0-9A-F]{4}")
+STATUS_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+")
+UNSAFE_STATUS_NOTE = re.compile(r"[@`<>\r\n\v\f\x1c-\x1e\x85\u2028\u2029]|http", re.IGNORECASE)
+
+
+def valid_status_devices(devices):
+    # This script is shipped alone to the issue-writing job. Keep its small,
+    # fail-open validator local; never import code from the checkout here.
+    valid = {}
+    if not isinstance(devices, dict):
+        return valid
+    for device_id, entry in devices.items():
+        if not isinstance(device_id, str) or not STATUS_ID.fullmatch(device_id) or not isinstance(entry, dict):
+            continue
+        if set(entry) - {"status", "version", "note", "reports", "rank"}:
+            continue
+        if not isinstance(entry.get("status"), str) or entry["status"] not in {
+                "beta", "researching", "no-evidence", "not-a-device"}:
+            continue
+        if (entry["status"] == "beta" or "version" in entry) and (
+                not isinstance(entry.get("version"), str) or not STATUS_VERSION.fullmatch(entry["version"])):
+            continue
+        if "note" in entry and (not isinstance(entry["note"], str) or len(entry["note"]) > 60
+                                or UNSAFE_STATUS_NOTE.search(entry["note"])):
+            continue
+        if any(field in entry and (type(entry[field]) is not int or entry[field] < minimum)
+               for field, minimum in (("reports", 0), ("rank", 1))):
+            continue
+        valid[device_id] = entry
+    return valid
+
+
+def load_device_status(path):
+    try:
+        value = read_json(path)
+    except (OSError, ValueError):
+        return {}
+    if (not isinstance(value, dict) or type(value.get("schema")) is not int
+            or value["schema"] != 1 or set(value) - {"schema", "devices"}):
+        return {}
+    return valid_status_devices(value.get("devices"))
+
+
+def status_matches(rows, devices):
+    devices = valid_status_devices(devices)
+    matched = {}
+    for row in rows:
+        if row[3] == "unadapted":
+            device_id = f"{row[0]:04X}:{row[1]:04X}"
+            if device_id in devices:
+                matched.setdefault(device_id, devices[device_id])
+    return matched
+
+
+def status_sentence(device_id, entry):
+    status, note = entry["status"], entry.get("note", "")
+    if status == "beta":
+        extra = f"（{note}）" if note else ""
+        return (f"{device_id}：测试版 {entry['version']} 已加入读取，待实机验证{extra}。"
+                f"旧版可开启「提醒测试版更新」，也可从[该版发布页]({RELEASES}/tag/v{entry['version']})下载完整 ZIP。"
+                "已使用此版或更高版本，可直接对照官方软件的电量。")
+    if status == "not-a-device":
+        return f"{device_id}：{note or '这是没有独立电量的配件'}，不需要适配。"
+    text = ("已有协议线索，正在研究，有进展会在这里更新。" if status == "researching"
+            else "目前还缺协议资料，暂时无法读取。")
+    if entry.get("reports", 0) >= 3:
+        text += f"已有 {entry['reports']} 条同款反馈"
+        if entry.get("rank", 21) <= 20:
+            text += f"，在待适配清单里排第 {entry['rank']} 位"
+        text += "。"
+    return f"{device_id}：{text}"
+
+
+def has_reply_credential(body):
+    # Only a complete footer line counts, within the last three lines. Text in
+    # descriptions, quoted examples or comments must not activate this route.
+    tail = body.splitlines()[-3:]
+    while tail and not tail[-1].strip():
+        tail.pop()
+    return bool(tail and REPLY_CREDENTIAL.fullmatch(tail[-1]))
+
+
+def comments_list(value):
+    if not isinstance(value, list):
+        return []
+    return [comment for page in value for comment in (page if isinstance(page, list) else [page])
+            if isinstance(comment, dict)]
+
+
+def labels_of(issue):
+    return sorted({item if isinstance(item, str) else item["name"] for item in issue.get("labels", [])})
+
+
+def device_row(match, line, source):
+    # Product names may contain ID-shaped text; collections follow the last quote.
+    tail = line[match.end():]
+    if '"' in tail:
+        name, tail = tail.rsplit('"', 1)
+        name = name.split('"', 1)[-1]
+    else:
+        collection = PAIR.search(tail)
+        name = tail[:collection.start()] if collection else tail
+    name = line[:match.start()] + name
+    collections = tuple((int(m[1], 16), int(m[2], 16)) for m in PAIR.finditer(tail))
+    return (int(match[1], 16), int(match[2], 16), collections, source, name.strip())
+
+
+def report_devices(text):
+    """Keep each device's collections on its own row, excluding quoted names.
+
+    Recognised report sections take precedence over loose VID:PID mentions.
+    This is important for card names, hidden duplicates and reader error text.
+    """
+    rows, section = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        # Older reports place kind/name/percentage cards outside card sections.
+        if LEGACY_CARD.match(line):
+            rows.append((None, None, (), "card", ""))
+            continue
+        heading = line.lstrip("# ")
+        matched = next((kind for title, kind in HEADINGS.items()
+                        if heading == title or heading.startswith(title + "（")), None)
+        if matched:
+            section = matched
+            continue
+        if line.startswith(("```", "~~~", "</details>", "### ")):
+            section = None
+            continue
+        if section == "ignore":
+            continue
+        if section == "card":
+            # FeedbackReport emits five fields even when VID:PID is unavailable.
+            # Card presence matters, but neither its name nor identity is evidence.
+            if len(line.split(" | ")) >= 5:
+                rows.append((None, None, (), "card", ""))
+            continue
+        if section == "unadapted":
+            match = PAIR.match(line)
+            if match:
+                rows.append(device_row(match, line, "unadapted"))
+            continue
+        matches = list(PAIR.finditer(line))
+        if matches:
+            # A loose inventory row follows the same first-ID, then-collections
+            # convention. A bare usage list is not a USB device identity.
+            first = matches[0]
+            if int(first[1], 16) in (0x0001, 0x000C) or int(first[1], 16) >= 0xFF00:
+                continue
+            rows.append(device_row(first, line, "mention"))
+    return rows
+
+
+def decide(issue, known, comments=None, known_next=None, device_status=None, trigger_comment_id=None):
+    labels = labels_of(issue)
+    result = {"label": None, "reply": None, "reason": "未命中设备或问题类型规则。", "remove_labels": []}
+    if "triage:locked" in labels or "pull_request" in issue:
+        result["reason"] = "维护者已锁定初筛。" if "triage:locked" in labels else "跳过 Pull Request。"
+        return result
+    comments = comments_list(issue.get("comments") if comments is None else comments)
+    if trigger_comment_id is not None:
+        # A release notice or other maintainer comment is not new user evidence:
+        # leave labels alone and never answer it with a template. Unknown or
+        # missing trigger comments fall through to the normal rules.
+        for comment in comments:
+            if (comment.get("id") == trigger_comment_id
+                    and comment.get("author_association") in MAINTAINER_ASSOCIATIONS
+                    and not (comment.get("body") or "").lstrip().startswith(SUPPLEMENT_PREFIX)):
+                result["reason"] = "维护者评论不触发初筛。"
+                return result
+    body = issue.get("body") or ""
+    category_match = TYPE.search(body)
+    category = category_match[1] if category_match else ""
+    rows = report_devices(body)
+    for comment in comments:
+        user = comment.get("user") or {}
+        if user.get("type") != "Bot" and not user.get("login", "").endswith("[bot]"):
+            rows.extend(report_devices(comment.get("body") or ""))
+    device_request = category in DEVICE_TYPES or (category not in BUG_TYPES and (
+        "### 反馈报告" in body or any(s in (issue.get("title") or "") for s in ("设备适配", "设备反馈"))))
+    index = {}
+    for device in known["devices"]:
+        index.setdefault((device["vendorId"], device["productId"]), []).append(device)
+    next_index = {}
+    for device in (known_next or {}).get("devices", []):
+        next_index.setdefault((device["vendorId"], device["productId"]), []).append(device)
+    vendors = {vid for ids in known["vendors"].values() for vid in ids}
+    vendors.update(vid for ids in (known_next or {}).get("vendors", {}).values() for vid in ids)
+    known_pairs = index.keys() | next_index.keys()
+    # A gate from any provider/source or revision restricts the whole shared ID.
+    # Neither a legacy duplicate nor a matching user product string clears it.
+    gated_pairs = {key for key in known_pairs
+                   if any(device.get("requiresModelMatch") is True
+                          for device in index.get(key, []) + next_index.get(key, []))}
+    reported = rows
+    has_card = any(row[3] == "card" for row in reported)
+    rows, ignored = [], []
+    for row in reported:
+        # Cards already have readings. Retain only their presence for needs-info
+        # and the card-only incorrect-reading exception, never their identities.
+        if row[3] == "card":
+            continue
+        if set(row[2]) == {(0x0001, 0x0002)} or NOISE_NAME.search(row[4]):
+            ignored.append(row)
+        else:
+            rows.append(row)
+    restricted = [row for row in rows if row[3] == "unadapted" and row[:2] in gated_pairs]
+    hits = [(row, index[row[:2]]) for row in rows
+            if row[3] == "unadapted" and row[:2] in index and row[:2] not in gated_pairs]
+    next_hits = [(row, next_index[row[:2]]) for row in rows
+                 if row[3] == "unadapted" and row[:2] not in index and row[:2] in next_index
+                 and row[:2] not in gated_pairs]
+    if has_card and (hits or next_hits):
+        # A sibling interface of a working card can still appear as unread.
+        # Classify the remaining devices, retaining hits only as a fallback.
+        hit_rows = {row for row, _ in hits + next_hits}
+        rows = [row for row in rows if row not in hit_rows]
+    new_vendors = [row for row in rows if row[0] not in vendors]
+    reply = None
+    title_subject = (issue.get("title") or "").rsplit("：", 1)[-1].strip()
+    if category in BUG_TYPES and UPDATE_FAILURE_TITLE.fullmatch(title_subject):
+        label, reason = "bug", "反馈标题明确报告程序更新失败。"
+        reply = (f"自动回复：内置更新失败时，可从[官方发布列表]({RELEASES})下载目标版本的完整 ZIP。"
+                 "请将 ZIP 完整解压到新目录，退出旧程序后运行新目录中的启动.bat。"
+                 "如需排查内置更新，请补充失败时的完整提示。")
+    elif device_request and not reported:
+        label, reason, reply = "needs-info", "设备类反馈缺少 VID:PID。", NEEDS_INFO
+    elif category == "电量或 DPI 不对" and reported and all(row[3] == "card" for row in reported):
+        label, reason = "bug", "只有已取得电量的卡片设备，但反馈电量或 DPI 读数不对，需要人工检查。"
+    elif (hits or next_hits) and (not has_card or not rows):
+        label = "supported" if hits else "in-next-release"
+        if has_card:
+            reason = "报告中已有取得电量的卡片，命中的 ID 可能是该卡片设备的接收器，需要人工检查。"
+        else:
+            reason = ("设备 ID 命中已发布版本的内置支持列表，但本次未取得电量。" if hits
+                      else "设备 ID 仅命中开发版支持列表，尚未包含在最新正式发布中。")
+            # Only repository-owned model names enter the fixed reply, never names
+            # supplied by the issue author. Neutralise mentions in future pack names.
+            names = sorted({d["name"].replace("@", "＠").replace("\n", " ").replace("\r", " ")
+                            for _, devices in (hits or next_hits) for d in devices})
+            reply = (SUPPORTED if hits else IN_NEXT_RELEASE).format(models="、".join(names))
+    elif any(row[:2] not in known_pairs and row[0] in vendors and any(page >= 0xFF00 for page, _ in row[2])
+             for row in rows):
+        label, reason = "pack-candidate", "已支持厂商的未知产品 ID，且同一设备带厂商自定义集合。"
+    elif new_vendors:
+        ids = "、".join(sorted({f"{row[0]:04X}:{row[1]:04X}" for row in new_vendors}))
+        label, reason = "new-vendor", "设备厂商 ID 不在当前支持范围：" + ids + "。"
+    elif restricted:
+        label, reason = "insufficient-evidence", "仅命中需型号确认的设备 ID，无法确认本次设备支持情况。"
+        if not has_card:
+            reply = MODEL_MATCH_REQUIRED
+    elif (rows and all(row[2] and all(page < 0xFF00 for page, _ in row[2]) for row in rows)) or (ignored and not rows):
+        label, reason = "insufficient-evidence", "排除噪声后只看到标准 HID 接口，无法确认私有电量协议。"
+    elif category in BUG_TYPES and not rows:
+        label, reason = "bug", "界面、操作或其他问题，未包含待分类设备 ID。"
+    elif rows:
+        label, reason = "insufficient-evidence", "缺少未取得电量设备的支持匹配或未知产品的厂商自定义集合证据。"
+    elif reported:
+        label, reason = "insufficient-evidence", "报告仅有已取得电量的卡片设备，缺少待分类设备的证据。"
+    else:
+        return result
+    if reply is None:
+        if label in ("pack-candidate", "new-vendor", "insufficient-evidence"):
+            reply = UNSUPPORTED
+        elif label == "bug":
+            reply = BUG_ACK
+    if restricted:
+        ids = "、".join(sorted({f"{row[0]:04X}:{row[1]:04X}" for row in restricted}))
+        reason += " 仅部分型号可读取的共享或受限 ID，需核对准确型号和接口：" + ids + "。"
+    if ignored:
+        ids = "、".join(sorted({f"{row[0]:04X}:{row[1]:04X}" for row in ignored}))
+        reason += " 已忽略触摸板、虚拟设备名称或仅含 0001:0002 集合的行：" + ids + "。"
+    result.update(label="triage:" + label, reason=reason)
+    result["remove_labels"] = [old for old in labels if old.startswith("triage:") and old != result["label"]]
+    unsupported_reply = reply == UNSUPPORTED
+    matched = status_matches(reported, device_status) if (
+        unsupported_reply or reply == MODEL_MATCH_REQUIRED or (reply and label == "in-next-release")) else {}
+    if reply and label == "supported":
+        matched = {device_id: entry for device_id, entry in status_matches(reported, device_status).items()
+                   if entry["status"] == "beta"}
+    if reply and not any((comment.get("user") or {}).get("login") == "github-actions[bot]"
+                         and MARKER in (comment.get("body") or "") for comment in comments):
+        if has_reply_credential(body):
+            reply = (NEEDS_INFO_WITH_REPLY if label == "needs-info" else reply.replace(
+                "请在这里补充一次新的反馈报告；没有 GitHub 账号的话，可以在程序里重新提交反馈，并在描述里写上本条编号。",
+                SUPPLEMENT_GUIDANCE))
+            if reply == UNSUPPORTED:
+                reply = reply.replace("请在这里回复软件名称、版本和下载地址",
+                                      "请在程序里打开‘我的反馈’，选中这条后点‘补充资料’，写上软件名称、版本和下载地址")
+        if matched:
+            sentences = "\n".join(status_sentence(device_id, entry)
+                                  for device_id, entry in list(matched.items())[:3])
+            accessories_only = (all(entry["status"] == "not-a-device" for entry in matched.values())
+                                and all(f"{row[0]:04X}:{row[1]:04X}" in matched for row in rows))
+            reply = ("自动回复：" + sentences if unsupported_reply and accessories_only
+                     else reply + "\n\n" + sentences)
+        result["reply"] = MARKER + "\n" + reply
+    return result
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--issue", required=True)
+    parser.add_argument("--comments")
+    parser.add_argument("--known-ids", required=True)
+    parser.add_argument("--known-ids-next", help="main index; --known-ids is the latest release")
+    parser.add_argument("--device-status", help="optional, fail-open device status table")
+    parser.add_argument("--trigger-comment-id", type=int,
+                        help="id of the comment whose creation started this run, if any")
+    args = parser.parse_args()
+    result = decide(read_json(args.issue), read_json(args.known_ids),
+                    read_json(args.comments) if args.comments else None,
+                    read_json(args.known_ids_next) if args.known_ids_next else None,
+                    load_device_status(args.device_status) if args.device_status else None,
+                    args.trigger_comment_id)
+    print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

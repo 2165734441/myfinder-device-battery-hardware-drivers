@@ -1,0 +1,139 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using AtkBattery;
+
+namespace AtkBatteryTray {
+    public sealed class BatteryView {
+        public string Name;
+        public int? Percent;
+        public bool Fresh, Charging;
+        public bool Approximate;
+        public bool Unconfirmed;
+        public bool SystemProvided;
+        public DateTime ConfirmedAt,QueriedAt;
+        public static string FormatTime(DateTime value){var local=value.ToLocalTime();return value==DateTime.MinValue?"":local.ToString(local.Date==DateTime.Now.Date?"HH:mm":"M/d HH:mm");}
+        public string TimeText {get {return FormatTime(ConfirmedAt);}}
+        public string QueryText {get{return FormatTime(QueriedAt);}}
+        public string Key {get {return Name+"|"+Percent+"|"+Fresh+"|"+Charging+"|"+Approximate+"|"+Unconfirmed+"|"+SystemProvided+"|"+(!Fresh?TimeText:"")+"|"+(SystemProvided?QueryText:"");}}
+        public string Tooltip {get {return TooltipFor(Name);}}
+        public string TooltipFor(string displayName) {return displayName+" "+(Percent.HasValue?(Approximate?"约":"")+Percent+"%"+(Unconfirmed?"（待确认）":""):"--")+
+            (Percent.HasValue&&!Fresh?SystemProvided?"（系统提供"+(String.IsNullOrEmpty(QueryText)?"":"，最近查询 "+QueryText)+"）":String.IsNullOrEmpty(TimeText)?"（历史读数，时间未知）":"（上次 "+TimeText+"）":Charging?" · 充电中":"");}
+    }
+    public sealed class TrayView {
+        public BatteryView Battery;
+        public string Tooltip;
+        public string DeviceKind;
+        public bool UpdateBadge;
+        public Color UpdateColor;
+    }
+    internal sealed class AudioCardView {
+        internal string Subtitle,EndpointId;
+        internal bool HasTarget {get{return !String.IsNullOrEmpty(EndpointId);}}
+    }
+    public sealed class PanelFeedback {
+        public int PendingStage=-1;
+        public string PendingOutput, DpiFailure, AudioFailure;
+        public string UpdatedNotice;
+        public bool MicrophonePending, ManualRefreshing,AudioBlocked;
+        public bool ShowPendingHints;
+        public int HoverAction=-1,PressedAction=-1;
+        public int KeyboardFocus=-1;
+        public int VolumePreview=-1;
+        public string Key {get {return PendingStage+"|"+PendingOutput+"|"+MicrophonePending+"|"+ManualRefreshing+"|"+AudioBlocked+"|"+DpiFailure+"|"+AudioFailure+"|"+KeyboardFocus+"|"+ShowPendingHints+"|"+HoverAction+"|"+PressedAction+"|"+VolumePreview+"|"+UpdatedNotice;}}
+    }
+    public static class UiState {
+        // Receiver audio endpoints can remain active after the wireless headset disconnects.
+        // Use existing readings only, and restrict this exclusion to card visibility.
+        internal static bool IsDisconnectedWirelessHeadset(AudioDeviceChoice endpoint,HeadsetReading headset,IEnumerable<WirelessDevice> wirelessDevices) {
+            if(endpoint==null||endpoint.Flow!=0)return false;
+            if(headset!=null&&headset.ReceiverPresent&&!VisualDesign.ShouldShowHeadset(headset)&&AudioControl.IsHyperXEndpoint(endpoint.InterfaceName,endpoint.Name,0))return true;
+            if(wirelessDevices!=null&&!String.IsNullOrWhiteSpace(endpoint.InterfaceName))foreach(var device in wirelessDevices)
+                if(device!=null&&device.Kind=="headset"&&(!device.Online||device.ConnectionState=="disconnected"||device.ConnectionState=="unconfirmed")&&
+                    String.Equals(endpoint.InterfaceName.Trim(),(device.Name??"").Trim(),StringComparison.OrdinalIgnoreCase))return true;
+            return false;
+        }
+        internal static AudioCardView AudioCard(AudioReading audio,AudioBindings preferences,HeadsetReading headset=null,IEnumerable<WirelessDevice> wirelessDevices=null) {
+            if(audio==null||audio.Devices==null)return null;
+            string bound=preferences.HeadsetEndpointId;
+            if(!String.IsNullOrEmpty(bound))foreach(var endpoint in audio.Devices)
+                if(endpoint!=null&&endpoint.Flow==0&&AudioControl.SameId(endpoint.Id,bound)) {
+                    if(IsDisconnectedWirelessHeadset(endpoint,headset,wirelessDevices))return null;
+                    return new AudioCardView {EndpointId=endpoint.Id,Subtitle=endpoint.Name??"耳机端点"};
+                }
+            AudioDeviceChoice single=null;int count=0;
+            foreach(var endpoint in audio.Devices)if(endpoint!=null&&endpoint.Flow==0&&AudioControl.IsHeadphone(endpoint.FormFactor)&&!IsDisconnectedWirelessHeadset(endpoint,headset,wirelessDevices)){single=endpoint;count++;}
+            if(count==0)return null;
+            if(count>1)return new AudioCardView {Subtitle="多个耳机端点，请在音频设置中绑定"};
+            return new AudioCardView {EndpointId=String.IsNullOrEmpty(bound)?single.Id:null,Subtitle=String.IsNullOrEmpty(bound)?single.Name??"耳机端点":"已绑定耳机未连接，请在音频设置中绑定"};
+        }
+        public static bool Recent(DateTime timestamp,DateTime now,double seconds) {
+            return timestamp!=DateTime.MinValue&&timestamp<=now.AddSeconds(5)&&(now-timestamp).TotalSeconds<=seconds;
+        }
+        public static BatteryView Mouse(BatteryReading current,BatteryReading last,DateTime now) {
+            var value=current??last;
+            return new BatteryView {Name="鼠标",Percent=value==null?(int?)null:value.Percent,
+                Fresh=current!=null&&Recent(current.TimestampUtc,now,90),
+                Charging=current!=null&&current.Charging&&Recent(current.TimestampUtc,now,90),
+                ConfirmedAt=value==null?DateTime.MinValue:value.TimestampUtc};
+        }
+        public static BatteryView Headset(HeadsetReading value,DateTime now) {
+            bool connected=value!=null&&value.Connected;
+            bool radio=connected&&value.ConnectionVerified;
+            return new BatteryView {Name="耳机",Percent=connected&&value.Percent.HasValue&&value.Percent>=0&&value.Percent<=100?value.Percent:null,
+                Fresh=radio&&value.Percent.HasValue&&Recent(value.BatteryTimestampUtc,now,90),
+                Charging=radio&&value.Charging==true&&Recent(value.ChargingTimestampUtc,now,90),
+                ConfirmedAt=connected?value.BatteryTimestampUtc:DateTime.MinValue};
+        }
+        public static TrayView Tray(string source,BatteryView mouse,BatteryView headset) {
+            BatteryView chosen=mouse;
+            if(source=="headset")chosen=headset;
+            else if(source=="lowest") {
+                if(headset.Percent.HasValue&&(!mouse.Percent.HasValue||
+                    (headset.Fresh==mouse.Fresh?headset.Percent<mouse.Percent:headset.Fresh)))chosen=headset;
+            }
+            string tooltip=(source=="lowest"?"最低电量 · ":"")+chosen.Name+"\n"+mouse.Tooltip+" | "+headset.Tooltip;
+            if(tooltip.Length>63)tooltip=tooltip.Substring(0,62)+"…";
+            return new TrayView {Battery=chosen,Tooltip=tooltip,DeviceKind=chosen==headset?"headset":"mouse"};
+        }
+        public static bool SkipConfirmedStage(DpiConfig dpi,string error,int requested,bool switching,DateTime now) {
+            return !switching&&dpi!=null&&dpi.ActiveStage==requested&&String.IsNullOrEmpty(error)&&Recent(dpi.TimestampUtc,now,5);
+        }
+        public static string SyncText(BatteryView reading,DateTime now) {
+            if(reading==null||!reading.Percent.HasValue)return "等待设备回读";
+            if(!reading.Fresh||!Recent(reading.ConfirmedAt,now,90))return "上次确认 "+reading.TimeText;
+            int seconds=(int)Math.Max(0,(now-reading.ConfirmedAt).TotalSeconds);
+            return seconds<5?"刚刚确认":seconds<60?(seconds/5*5)+"秒前确认":(seconds/60)+"分钟前确认";
+        }
+        public static Size ScaleSize(Size logical,float scale) {
+            return new Size((int)Math.Round(logical.Width*scale),(int)Math.Round(logical.Height*scale));
+        }
+        public static PointF LogicalPoint(Point physical,float scale) {return new PointF(physical.X/scale,physical.Y/scale);}
+        public static string EndpointName(AudioReading audio,string id) {
+            if(audio!=null&&audio.Devices!=null)foreach(var device in audio.Devices)
+                if(String.Equals(id,device.Id,StringComparison.OrdinalIgnoreCase))return device.Name;
+            return String.IsNullOrEmpty(id)?"未检测到":"设备未连接";
+        }
+        public static string CurrentOutputName(AudioReading audio) {
+            if(audio==null)return "系统输出未确认";
+            string id=audio.ConsoleOutputId;
+            if(String.IsNullOrEmpty(id))return "未检测到系统输出";
+            if(audio.Devices!=null)foreach(var device in audio.Devices)
+                if(device!=null&&AudioControl.SameId(id,device.Id)&&!String.IsNullOrWhiteSpace(device.Name))return device.Name;
+            if(AudioControl.SameId(id,audio.SpeakerId)&&!String.IsNullOrWhiteSpace(audio.SpeakerName))return audio.SpeakerName;
+            if(AudioControl.SameId(id,audio.HeadsetId)&&!String.IsNullOrWhiteSpace(audio.HeadsetName))return audio.HeadsetName;
+            return "当前系统输出（名称未确认）";
+        }
+    }
+    public sealed class LowBatteryPolicy {
+        readonly Dictionary<string,bool> notified=new Dictionary<string,bool>();
+        public bool IsLatched(string device) {bool value;return notified.TryGetValue(device,out value)&&value;}
+        public void Restore(string device,bool value) {notified[device]=value;}
+        public bool Observe(string device,BatteryView battery,bool mayNotify,int threshold=20) {
+            if(battery.Unconfirmed||!battery.Fresh||!battery.Percent.HasValue)return false;
+            if(battery.Charging||battery.Percent>=30){notified[device]=false;return false;}
+            if(battery.Percent>threshold||IsLatched(device)||!mayNotify)return false;
+            notified[device]=true;return true;
+        }
+    }
+}
