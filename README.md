@@ -16,7 +16,9 @@
 >
 > 详细硬件清单与边界说明：[docs/hardware-drivers.md](docs/hardware-drivers.md)
 >
-> 直接下载：[硬件驱动增强版 Release](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/tag/v1.3.11-beta.14-hardware-drivers)
+> 直接下载（推荐发给别人）：[便携版 ZIP](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/download/v1.3.11-beta.14-hardware-drivers/MyFinder-Device-Battery-Portable-v1.3.11-beta.14-Windows-x64.zip)
+>
+> Release 页面（含安装版目录包）：[硬件驱动增强版 Release](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/tag/v1.3.11-beta.14-hardware-drivers)
 >
 > 这些入口只负责**发现并启动厂商自己的软件**，不冒充厂商驱动，也不向未经验证的硬件发送报文。
 
