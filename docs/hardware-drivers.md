@@ -1,6 +1,12 @@
 # 硬件驱动增强版说明
 
-本分支基于 [wushuai0802/myfinder-device-battery](https://github.com/wushuai0802/myfinder-device-battery) 修改，保留原有电量卡片、设备读取和托盘界面，新增以下硬件控制与厂商软件入口。
+本分支由 **2165734441** 基于原作者 **wushuai0802** 的项目 [wushuai0802/myfinder-device-battery](https://github.com/wushuai0802/myfinder-device-battery) 修改，**不是原作者官方版本**。上游版本为 `1.3.11-beta.14`，本分支保留原有电量卡片、设备读取和托盘界面，只新增以下硬件控制与厂商软件入口。
+
+- 原作者 / 上游维护者：GitHub [@wushuai0802](https://github.com/wushuai0802)
+- 上游仓库：https://github.com/wushuai0802/myfinder-device-battery
+- 本仓库：https://github.com/2165734441/myfinder-device-battery-hardware-drivers
+- 许可证：AGPL-3.0-only（原项目版权归原作者及贡献者所有）
+- 来源与致谢：见 [CREDITS.md](../CREDITS.md)；继续开发见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 1. 鼠标硬件控制（雷柏 VT7 V2）
 
