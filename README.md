@@ -1,8 +1,15 @@
 # MyFinder Device Battery
 
-> ## 硬件驱动增强版（本仓库）
+> ## 基于原作者项目的硬件驱动增强分支
 >
-> 这是在上游 `wushuai0802/myfinder-device-battery` 基础上制作的**本地增强分支**，不是上游官方版本。
+> **这不是原创项目，也不是原作者的官方版本。**
+>
+> - 上游项目：**MyFinder Device Battery**
+> - 原作者 / 上游维护者：GitHub **[@wushuai0802](https://github.com/wushuai0802)**
+> - 上游仓库：[wushuai0802/myfinder-device-battery](https://github.com/wushuai0802/myfinder-device-battery)
+> - 本分支基于上游 **1.3.11-beta.14** 修改，保留原有电量卡片、设备读取、托盘界面和更新检查。
+> - 本仓库：[2165734441/myfinder-device-battery-hardware-drivers](https://github.com/2165734441/myfinder-device-battery-hardware-drivers)
+> - 许可证：**AGPL-3.0-only**；原项目版权归原作者及贡献者所有，本分支只新增下面这些改动。
 >
 > 在原有电量卡片之外新增：
 >
@@ -11,14 +18,21 @@
 > - **耳机控制**：Windows Sonic 7.1 虚拟环绕、变声器、麦克风降噪。
 > - **开机自启**：托盘右键或设置页一键开关，只写当前用户启动文件夹，不弹 UAC。
 > - **外设驱动中心**：内置 34 个键盘 / 鼠标 / 耳机 / 手柄 / ARGB 灯光软件入口，自动识别本机已安装的驱动，未安装的给官网下载。
+> - **便携发行版**：内置便携 Python 运行时，解压即用，不含个人配置和宏。
 >
 > 本机已识别的驱动包括 **XINMENG Driver（新盟键盘）**、**OpenRGB（ARGB 灯光）**、**北通智控（手柄）**、雷柏 A HUB、XIBERIA Audio Center、MCHOSE HUB、JoyToKey；另外收录罗技 G HUB、雷蛇 Synapse、SteelSeries GG、Corsair iCUE、HyperX NGENUITY、ASUS Armoury Crate、MSI Center、GIGABYTE Control Center、ASRock Polychrome、OpenRGB、SignalRGB、VIA、QMK、Keychron Launcher、Wootility、ATK HUB、VGN/VXE HUB、MonsGeek、Akko、达尔优、黑爵、狼蛛、迈从、飞智空间站、8BitDo、GameSir、Xbox Accessories、DS4Windows、reWASD、JoyToKey 等。
 >
 > 详细硬件清单与边界说明：[docs/hardware-drivers.md](docs/hardware-drivers.md)
 >
+> 来源与致谢：[CREDITS.md](CREDITS.md)
+>
+> 继续开发 / 构建 / 测试：[CONTRIBUTING.md](CONTRIBUTING.md)
+>
 > 直接下载（推荐发给别人）：[便携版 ZIP](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/download/v1.3.11-beta.14-hardware-drivers/MyFinder-Device-Battery-Portable-v1.3.11-beta.14-Windows-x64.zip)
 >
 > Release 页面（含安装版目录包）：[硬件驱动增强版 Release](https://github.com/2165734441/myfinder-device-battery-hardware-drivers/releases/tag/v1.3.11-beta.14-hardware-drivers)
+>
+> **继续创作：** 在遵守 **AGPL-3.0-only** 的前提下，欢迎 fork、修改和提交 PR；请保留原作者署名、上游链接、LICENSE 和源码地址，衍生作品继续使用 AGPL-3.0-only，并向网络用户提供对应源码。构建、测试和代码地图见 `CONTRIBUTING.md`。
 >
 > 这些入口只负责**发现并启动厂商自己的软件**，不冒充厂商驱动，也不向未经验证的硬件发送报文。
 
